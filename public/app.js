@@ -467,8 +467,10 @@ function closeSignalingSocket() {
 }
 
 function closePeerConnection() {
+  codec2.teardown();
   if (state.peerConnection) {
     state.peerConnection.onicecandidate = null;
+    state.peerConnection.ondatachannel = null;
     state.peerConnection.ontrack = null;
     state.peerConnection.onconnectionstatechange = null;
     state.peerConnection.oniceconnectionstatechange = null;
@@ -724,6 +726,7 @@ function pickAudioProfile({
 async function adaptAudioCompression(metrics) {
   const nextProfile = pickAudioProfile(metrics);
   if (nextProfile === state.audioProfile) {
+    await codec2.setDesiredActive(nextProfile === "extreme");
     return;
   }
 
@@ -740,6 +743,7 @@ async function adaptAudioCompression(metrics) {
   });
 
   await applySenderParameters();
+  await codec2.setDesiredActive(nextProfile === "extreme");
 }
 
 async function createPeerConnection() {
@@ -848,6 +852,7 @@ async function createPeerConnection() {
 
   state.peerConnection = connection;
   await applySenderParameters();
+  await codec2.init(connection, stream, { initiator: shouldInitiateOffer() });
   updateControls();
 }
 
@@ -1413,19 +1418,198 @@ if (precall && joinButton) {
   precallObserver.observe(joinButton, { attributes: true, attributeFilter: ["disabled"] });
 }
 
-// ── Codec2 1.2kbps DataChannel transport ──
-// Activated when a codec2.wasm file is present and network is catastrophic.
-// Uses WebRTC DataChannel instead of RTP, bypassing Opus entirely.
-// To enable: place codec2.wasm in /public/ and set APP_CONFIG.enableCodec2 = true
+// ── Codec2 ultra-low-bitrate transport ──
+// Activated only on the most aggressive profile when both peers finish
+// Codec2 initialization and exchange readiness over a dedicated data channel.
 const codec2 = {
   active: false,
+  desiredActive: false,
+  localReady: false,
+  peerReady: false,
+  encoderReady: false,
+  decoderReady: false,
+  readyAnnouncementSent: false,
   encoderNode: null,
   decoderNode: null,
   dataChannel: null,
   audioContext: null,
+  sender: null,
+  originalTrack: null,
+  samplesPerFrame: 0,
+  bytesPerFrame: 0,
 
-  async init(peerConnection, localStream) {
-    if (!window.APP_CONFIG?.enableCodec2) return;
+  isSupported() {
+    return Boolean(
+      window.APP_CONFIG?.enableCodec2 &&
+      typeof window.AudioContext === "function" &&
+      typeof window.AudioWorkletNode === "function" &&
+      typeof window.WebAssembly === "object"
+    );
+  },
+
+  handleWorkerMessage(kind, data) {
+    if (data.type === "error") {
+      log(`Codec2 ${kind} failed`, { message: data.error });
+      this.desiredActive = false;
+      this.syncActiveState().catch((error) => {
+        log("Codec2 deactivation failed", { message: error.message });
+      });
+      return;
+    }
+
+    if (data.type === "ready") {
+      this.samplesPerFrame = data.samplesPerFrame || this.samplesPerFrame;
+      this.bytesPerFrame = data.bytesPerFrame || this.bytesPerFrame;
+
+      if (kind === "encoder") {
+        this.encoderReady = true;
+      } else {
+        this.decoderReady = true;
+      }
+
+      if (this.encoderReady && this.decoderReady && !this.localReady) {
+        this.localReady = true;
+        log("Codec2 worklets ready", {
+          mode: data.mode,
+          samplesPerFrame: this.samplesPerFrame,
+          bytesPerFrame: this.bytesPerFrame
+        });
+        this.maybeAnnounceReady();
+        this.syncActiveState().catch((error) => {
+          log("Codec2 activation sync failed", { message: error.message });
+        });
+      }
+      return;
+    }
+
+    if (kind === "encoder" && data.type === "encoded") {
+      if (this.active && this.dataChannel?.readyState === "open") {
+        this.dataChannel.send(data.data);
+      }
+    }
+  },
+
+  attachDataChannel(channel) {
+    if (this.dataChannel === channel) {
+      return;
+    }
+
+    this.dataChannel = channel;
+    channel.binaryType = "arraybuffer";
+    channel.onopen = () => {
+      log("Codec2 data channel open");
+      this.maybeAnnounceReady();
+      this.syncActiveState().catch((error) => {
+        log("Codec2 open sync failed", { message: error.message });
+      });
+    };
+    channel.onclose = () => {
+      log("Codec2 data channel closed");
+      this.peerReady = false;
+      this.readyAnnouncementSent = false;
+      this.syncActiveState().catch((error) => {
+        log("Codec2 close sync failed", { message: error.message });
+      });
+    };
+    channel.onerror = () => {
+      log("Codec2 data channel error");
+    };
+    channel.onmessage = (event) => {
+      if (typeof event.data === "string") {
+        try {
+          const message = JSON.parse(event.data);
+          if (message.type === "codec2-ready") {
+            this.peerReady = true;
+            log("Codec2 peer ready", {
+              samplesPerFrame: message.samplesPerFrame,
+              bytesPerFrame: message.bytesPerFrame
+            });
+            this.syncActiveState().catch((error) => {
+              log("Codec2 peer sync failed", { message: error.message });
+            });
+          }
+        } catch (error) {
+          log("Codec2 control message ignored", { message: error.message });
+        }
+        return;
+      }
+
+      if (!(event.data instanceof ArrayBuffer) || !this.decoderNode) {
+        return;
+      }
+
+      this.decoderNode.port.postMessage(
+        { type: "decode", data: event.data },
+        [event.data]
+      );
+    };
+  },
+
+  maybeAnnounceReady() {
+    if (
+      !this.localReady ||
+      !this.dataChannel ||
+      this.dataChannel.readyState !== "open" ||
+      this.readyAnnouncementSent
+    ) {
+      return;
+    }
+
+    this.dataChannel.send(JSON.stringify({
+      type: "codec2-ready",
+      samplesPerFrame: this.samplesPerFrame,
+      bytesPerFrame: this.bytesPerFrame
+    }));
+    this.readyAnnouncementSent = true;
+  },
+
+  async syncActiveState() {
+    const shouldBeActive = Boolean(
+      this.desiredActive &&
+      this.localReady &&
+      this.peerReady &&
+      this.dataChannel &&
+      this.dataChannel.readyState === "open" &&
+      this.sender &&
+      this.originalTrack
+    );
+
+    if (shouldBeActive === this.active) {
+      return;
+    }
+
+    if (shouldBeActive) {
+      await this.sender.replaceTrack(null);
+      remoteAudio.muted = true;
+      this.active = true;
+      log("Codec2 transport active", {
+        samplesPerFrame: this.samplesPerFrame,
+        bytesPerFrame: this.bytesPerFrame
+      });
+      return;
+    }
+
+    if (this.sender && this.originalTrack) {
+      await this.sender.replaceTrack(this.originalTrack);
+    }
+    remoteAudio.muted = false;
+    this.active = false;
+    log("Codec2 transport inactive");
+  },
+
+  async setDesiredActive(enabled) {
+    this.desiredActive = Boolean(enabled);
+    if (!this.isSupported()) {
+      return;
+    }
+    await this.syncActiveState();
+  },
+
+  async init(peerConnection, localStream, { initiator = false } = {}) {
+    this.teardown();
+    if (!this.isSupported()) {
+      return;
+    }
 
     try {
       const wasmResponse = await fetch("/codec2.wasm");
@@ -1442,58 +1626,59 @@ const codec2 = {
       const encoderNode = new AudioWorkletNode(audioCtx, "codec2-encoder");
       const source = audioCtx.createMediaStreamSource(localStream);
       source.connect(encoderNode);
+      encoderNode.port.onmessage = (e) => this.handleWorkerMessage("encoder", e.data);
       encoderNode.port.postMessage({ type: "init", module: wasmModule });
 
       // Decoder: DataChannel → Codec2 → speaker
       const decoderNode = new AudioWorkletNode(audioCtx, "codec2-decoder");
       decoderNode.connect(audioCtx.destination);
+      decoderNode.port.onmessage = (e) => this.handleWorkerMessage("decoder", e.data);
       decoderNode.port.postMessage({ type: "init", module: wasmModule });
 
-      // DataChannel for binary codec2 frames
-      const dc = peerConnection.createDataChannel("codec2", {
-        ordered: false,
-        maxRetransmits: 0
-      });
+      this.sender = peerConnection
+        .getSenders()
+        .find((item) => item.track && item.track.kind === "audio") || null;
+      this.originalTrack = localStream.getAudioTracks()[0] || null;
+      this.desiredActive = state.audioProfile === "extreme";
 
-      dc.binaryType = "arraybuffer";
-      dc.onmessage = (e) => {
-        decoderNode.port.postMessage(
-          { type: "decode", data: e.data },
-          [e.data]
-        );
-      };
-
-      encoderNode.port.onmessage = (e) => {
-        if (e.data.type === "encoded" && dc.readyState === "open") {
-          dc.send(e.data.data);
-        }
-      };
-
-      // Handle incoming DataChannel from peer
       peerConnection.ondatachannel = (event) => {
         if (event.channel.label === "codec2") {
-          event.channel.binaryType = "arraybuffer";
-          event.channel.onmessage = (e) => {
-            decoderNode.port.postMessage(
-              { type: "decode", data: e.data },
-              [e.data]
-            );
-          };
+          this.attachDataChannel(event.channel);
         }
       };
+
+      if (initiator) {
+        const channel = peerConnection.createDataChannel("codec2", {
+          ordered: false,
+          maxRetransmits: 0
+        });
+        this.attachDataChannel(channel);
+      }
 
       this.encoderNode = encoderNode;
       this.decoderNode = decoderNode;
-      this.dataChannel = dc;
       this.audioContext = audioCtx;
-      this.active = true;
-      log("Codec2 1.2kbps mode initialized");
+      log("Codec2 transport initialized");
     } catch (error) {
       log("Codec2 init failed, using Opus", { message: error.message });
+      this.teardown();
     }
   },
 
   teardown() {
+    this.desiredActive = false;
+    if (this.sender && this.originalTrack && this.active) {
+      this.sender.replaceTrack(this.originalTrack).catch(() => {});
+    }
+    this.active = false;
+    this.localReady = false;
+    this.peerReady = false;
+    this.encoderReady = false;
+    this.decoderReady = false;
+    this.readyAnnouncementSent = false;
+    this.samplesPerFrame = 0;
+    this.bytesPerFrame = 0;
+    remoteAudio.muted = false;
     if (this.audioContext) {
       this.audioContext.close().catch(() => {});
     }
@@ -1504,6 +1689,7 @@ const codec2 = {
     this.decoderNode = null;
     this.dataChannel = null;
     this.audioContext = null;
-    this.active = false;
+    this.sender = null;
+    this.originalTrack = null;
   }
 };

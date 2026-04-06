@@ -335,13 +335,17 @@ function buildIceServersForParticipant(participantId) {
 }
 
 function appConfigScript() {
+  const codec2Available =
+    fs.existsSync(path.join(PUBLIC_DIR, "codec2.wasm")) &&
+    fs.existsSync(path.join(PUBLIC_DIR, "codec2-worker.js"));
   const config = {
     iceServers: buildIceServers().filter((server) => {
       const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
       return urls.every((url) => !String(url).startsWith("turn:") && !String(url).startsWith("turns:"));
     }),
     maxReconnectDelayMs: 5000,
-    wsPath: "/ws"
+    wsPath: "/ws",
+    enableCodec2: codec2Available
   };
 
   return `window.APP_CONFIG = ${JSON.stringify(config, null, 2)};`;
