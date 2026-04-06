@@ -1,0 +1,113 @@
+services:
+  voiceai:
+    build:
+      context: .
+    image: voiceai:latest
+    container_name: voiceai
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000
+      AUTH_USERNAME: ${AUTH_USERNAME:-}
+      AUTH_PASSWORD: ${AUTH_PASSWORD:-}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      REDIS_PREFIX: ${REDIS_PREFIX:-voiceai}
+      STUN_URLS: ${STUN_URLS:-stun:stun.l.google.com:19302}
+      TURN_URLS: ${TURN_URLS:-turn:${TURN_REALM:?TURN_REALM must be set}:3478?transport=udp,turn:${TURN_REALM:?TURN_REALM must be set}:3478?transport=tcp}
+      TURN_AUTH_SECRET: ${TURN_AUTH_SECRET:?TURN_AUTH_SECRET must be set}
+      TURN_REALM: ${TURN_REALM:?TURN_REALM must be set}
+      TURN_CREDENTIAL_TTL_SECONDS: ${TURN_CREDENTIAL_TTL_SECONDS:-3600}
+      ALLOWED_ORIGIN: ${ALLOWED_ORIGIN:-}
+      RATE_LIMIT_WINDOW_MS: ${RATE_LIMIT_WINDOW_MS:-60000}
+      RATE_LIMIT_MAX_REQUESTS: ${RATE_LIMIT_MAX_REQUESTS:-240}
+      POLL_TIMEOUT_MS: ${POLL_TIMEOUT_MS:-20000}
+      ROOM_IDLE_MS: ${ROOM_IDLE_MS:-300000}
+      PARTICIPANT_IDLE_MS: ${PARTICIPANT_IDLE_MS:-45000}
+      SHUTDOWN_GRACE_MS: ${SHUTDOWN_GRACE_MS:-10000}
+      MAX_EVENTS_PER_PARTICIPANT: ${MAX_EVENTS_PER_PARTICIPANT:-128}
+      WS_PING_INTERVAL_MS: ${WS_PING_INTERVAL_MS:-20000}
+    depends_on:
+      redis:
+        condition: service_healthy
+      coturn:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ready | grep -q '\"ok\":true' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: ${TRAEFIK_NETWORK:-traefik-public}
+      traefik.http.routers.voiceai.rule: Host(`${VOICEAI_HOST:?VOICEAI_HOST must be set}`)
+      traefik.http.routers.voiceai.entrypoints: websecure
+      traefik.http.routers.voiceai.tls: "true"
+      traefik.http.routers.voiceai.tls.certresolver: ${TRAEFIK_CERTRESOLVER:-letsencrypt}
+      traefik.http.routers.voiceai.service: voiceai
+      traefik.http.services.voiceai.loadbalancer.server.port: "3000"
+      traefik.http.middlewares.voiceai-compress.compress: "true"
+      traefik.http.middlewares.voiceai-headers.headers.stsSeconds: "31536000"
+      traefik.http.middlewares.voiceai-headers.headers.stsIncludeSubdomains: "true"
+      traefik.http.middlewares.voiceai-headers.headers.stsPreload: "true"
+      traefik.http.middlewares.voiceai-headers.headers.browserXssFilter: "true"
+      traefik.http.middlewares.voiceai-headers.headers.contentTypeNosniff: "true"
+      traefik.http.routers.voiceai.middlewares: voiceai-compress,voiceai-headers
+    networks:
+      - default
+      - traefik-public
+
+  redis:
+    image: redis:7-alpine
+    container_name: voiceai-redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    tmpfs:
+      - /data
+
+  coturn:
+    image: coturn/coturn:4.6.3
+    container_name: voiceai-coturn
+    restart: unless-stopped
+    command:
+      - -n
+      - --log-file=stdout
+      - --fingerprint
+      - --lt-cred-mech
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_AUTH_SECRET:?TURN_AUTH_SECRET must be set}
+      - --realm=${TURN_REALM:?TURN_REALM must be set}
+      - --listening-ip=0.0.0.0
+      - --external-ip=${TURN_EXTERNAL_IP:?TURN_EXTERNAL_IP must be set}
+      - --listening-port=3478
+      - --min-port=${TURN_MIN_PORT:-49160}
+      - --max-port=${TURN_MAX_PORT:-49200}
+      - --stale-nonce
+      - --no-cli
+      - --no-loopback-peers
+      - --no-multicast-peers
+      - --user-quota=${TURN_USER_QUOTA:-12}
+      - --total-quota=${TURN_TOTAL_QUOTA:-120}
+    ports:
+      - "${TURN_PORT:-3478}:3478/tcp"
+      - "${TURN_PORT:-3478}:3478/udp"
+      - "${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/udp"
+
+networks:
+  traefik-public:
+    external: true
+    name: ${TRAEFIK_NETWORK:-traefik-public}

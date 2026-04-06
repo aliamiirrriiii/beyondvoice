@@ -1,0 +1,20 @@
+self.addEventListener("install", (event) => {
+  event.waitUntil(self.skipWaiting());
+});
+
+self.addEventListener("activate", (event) => {
+  event.waitUntil((async () => {
+    const keys = await caches.keys();
+    await Promise.all(keys.map((key) => caches.delete(key)));
+    await self.registration.unregister();
+  })());
+});
+
+self.addEventListener("fetch", () => {
+  // Intentionally empty. This app should not cache-call assets aggressively.
+});
+self.addEventListener("message", (event) => {
+  if (event.data === "skipWaiting") {
+    self.skipWaiting();
+  }
+});

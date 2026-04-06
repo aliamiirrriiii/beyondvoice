@@ -1,0 +1,17 @@
+{
+  "name": "voiceai",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lightweight two-person VoIP app optimized for weak internet links.",
+  "dependencies": {
+    "redis": "^4.7.0",
+    "ws": "^8.18.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
