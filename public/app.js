@@ -14,6 +14,108 @@ if ("caches" in window) {
   }).catch(() => {});
 }
 
+// ── Unsupported in-app browser gate ───────────────────────────────
+// Telegram (and friends) ship a stripped-down WebView that can't run
+// WebRTC voice calls reliably. Detect → block UI → ask user to open
+// the link in their real browser. Runs before mic init so we never
+// prompt for microphone in a browser that can't use it.
+function detectUnsupportedInAppBrowser() {
+  if (typeof window === "undefined" || typeof navigator === "undefined") {
+    return null;
+  }
+  const ua = String(navigator.userAgent || "");
+  const hash = String(window.location.hash || "");
+  const search = String(window.location.search || "");
+
+  // Telegram in-app browser / Mini App
+  if (
+    /Telegram(?:WebView|Bot)?/i.test(ua) ||
+    (window.Telegram && window.Telegram.WebApp) ||
+    /tgWebApp(?:Data|Version|Platform|StartParam)/i.test(hash + search)
+  ) {
+    return { name: "Telegram", label: "Telegram's in-app browser" };
+  }
+
+  // Facebook / Instagram / Messenger WebViews — same WebRTC issues
+  if (/\bFBAN\/|\bFBAV\/|\bFB_IAB\b/i.test(ua)) {
+    return { name: "Facebook", label: "Facebook's in-app browser" };
+  }
+  if (/\bInstagram\b/i.test(ua)) {
+    return { name: "Instagram", label: "Instagram's in-app browser" };
+  }
+  if (/\bLine\//i.test(ua)) {
+    return { name: "Line", label: "Line's in-app browser" };
+  }
+
+  return null;
+}
+
+(function gateUnsupportedBrowsers() {
+  const detected = detectUnsupportedInAppBrowser();
+  if (!detected) return;
+
+  const block = document.getElementById("browser-block");
+  const precallEl = document.getElementById("precall");
+  const callEl = document.querySelector(".call");
+  const appLabel = document.getElementById("browser-block-app");
+  const copyBtn = document.getElementById("browser-block-copy");
+  const copyLabel = document.getElementById("browser-block-copy-label");
+
+  if (appLabel) {
+    appLabel.textContent = detected.label;
+  }
+  if (block) {
+    block.hidden = false;
+  }
+  if (precallEl) {
+    precallEl.style.display = "none";
+  }
+  if (callEl) {
+    callEl.style.display = "none";
+  }
+
+  if (copyBtn && copyLabel) {
+    copyBtn.addEventListener("click", async () => {
+      const url = window.location.href;
+      let copied = false;
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(url);
+          copied = true;
+        }
+      } catch {
+        copied = false;
+      }
+      if (!copied) {
+        // Manual fallback for WebViews where clipboard API is denied
+        try {
+          const ta = document.createElement("textarea");
+          ta.value = url;
+          ta.style.position = "fixed";
+          ta.style.opacity = "0";
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand("copy");
+          document.body.removeChild(ta);
+          copied = true;
+        } catch {
+          copied = false;
+        }
+      }
+      copyLabel.textContent = copied ? "Link copied" : "Copy failed";
+      copyBtn.classList.toggle("is-copied", copied);
+      setTimeout(() => {
+        copyLabel.textContent = "Copy link";
+        copyBtn.classList.remove("is-copied");
+      }, 2400);
+    });
+  }
+
+  // Hard-stop the rest of the script — no mic prompt, no socket setup,
+  // no WebRTC bring-up. The user can't make a call here regardless.
+  throw new Error("BeyondVoice: blocked unsupported in-app browser (" + detected.name + ")");
+})();
+
 const roomInput = document.querySelector("#room-input");
 const nameInput = document.querySelector("#name-input");
 const opusModeSelect = document.querySelector("#opus-mode-select");
@@ -308,9 +410,36 @@ function log(message, extra = null) {
   }
 }
 
+const STATUS_PILL_KIND = {
+  idle: "idle",
+  connected: "connected",
+  connecting: "connecting",
+  negotiating: "negotiating",
+  reconnecting: "reconnecting",
+  rejoining: "reconnecting",
+  waiting: "waiting",
+  failed: "failed"
+};
+
+function statusKindFor(text) {
+  const lower = String(text || "").toLowerCase();
+  if (lower.startsWith("connected")) return STATUS_PILL_KIND.connected;
+  if (lower.startsWith("connecting")) return STATUS_PILL_KIND.connecting;
+  if (lower.startsWith("negotiating")) return STATUS_PILL_KIND.negotiating;
+  if (lower.startsWith("reconnecting")) return STATUS_PILL_KIND.reconnecting;
+  if (lower.startsWith("rejoining")) return STATUS_PILL_KIND.reconnecting;
+  if (lower.startsWith("waiting")) return STATUS_PILL_KIND.waiting;
+  if (lower.includes("fail")) return STATUS_PILL_KIND.failed;
+  return STATUS_PILL_KIND.idle;
+}
+
 function updateStatus(text) {
   if (statusText) {
     statusText.textContent = text;
+  }
+  const pill = document.querySelector(".status-pill");
+  if (pill) {
+    pill.dataset.status = statusKindFor(text);
   }
 }
 
@@ -495,11 +624,115 @@ function destroyPeerContext(peerId) {
   peerContexts.delete(peerId);
 }
 
+function initialLetterFor(name) {
+  const trimmed = String(name || "").trim();
+  if (!trimmed) return "·";
+  const ch = trimmed.charAt(0);
+  return /[a-z0-9]/i.test(ch) ? ch.toUpperCase() : "·";
+}
+
+function ensureRemoteTile(peerId, displayName) {
+  const grid = document.getElementById("stage-grid");
+  if (!grid) return null;
+  const safeId = peerId.replace(/[^a-z0-9_-]/gi, "");
+  let tile = grid.querySelector(`[data-peer-id="${CSS.escape(peerId)}"]`);
+  if (!tile) {
+    tile = document.createElement("article");
+    tile.className = "tile tile-remote";
+    tile.dataset.peerId = peerId;
+    tile.innerHTML = `
+      <div class="tile-halo"></div>
+      <div class="tile-body">
+        <div class="tile-avatar">
+          <span class="tile-initial">${initialLetterFor(displayName || peerId)}</span>
+        </div>
+        <div class="tile-meta">
+          <span class="tile-name"></span>
+          <span class="tile-role">Remote</span>
+        </div>
+      </div>
+      <div class="tile-flags">
+        <span class="tile-flag tile-flag-mute" aria-label="Muted" title="Muted">
+          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="1" y1="1" x2="23" y2="23"/>
+            <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/>
+            <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/>
+            <line x1="12" y1="19" x2="12" y2="23"/>
+          </svg>
+        </span>
+      </div>
+    `;
+    grid.appendChild(tile);
+  }
+  const nameLabel = tile.querySelector(".tile-name");
+  const initial = tile.querySelector(".tile-initial");
+  const friendly = displayName || peerId;
+  if (nameLabel) nameLabel.textContent = friendly;
+  if (initial) initial.textContent = initialLetterFor(friendly);
+  return tile;
+}
+
+function renderParticipantTiles() {
+  const grid = document.getElementById("stage-grid");
+  if (!grid) return;
+
+  const localTile = grid.querySelector(".tile-local");
+  const peers = getPeerContexts();
+
+  // Local tile: reflect joined + muted state
+  if (localTile) {
+    const localInitial = localTile.querySelector("#local-initial");
+    if (localInitial) {
+      localInitial.textContent = initialLetterFor(state.displayName);
+    }
+    localTile.classList.toggle("is-live", Boolean(state.joined));
+    localTile.classList.toggle("is-muted", Boolean(state.muted));
+  }
+
+  // Reconcile remote tiles
+  const wantIds = new Set(peers.map((p) => p.id));
+  const existing = grid.querySelectorAll(".tile-remote");
+  existing.forEach((tile) => {
+    const id = tile.dataset.peerId;
+    if (!wantIds.has(id)) {
+      tile.classList.add("is-leaving");
+      // Remove after exit animation so count updates cleanly
+      setTimeout(() => tile.remove(), 200);
+    }
+  });
+
+  peers.forEach((peer) => {
+    const tile = ensureRemoteTile(peer.id, peer.displayName);
+    if (!tile) return;
+    const connState = peer.connection?.connectionState || "new";
+    tile.classList.toggle("is-live", connState === "connected");
+  });
+
+  // Update tile count (local + peers that are not being removed)
+  const aliveCount = 1 + peers.length;
+  grid.dataset.count = String(Math.min(aliveCount, 12));
+}
+
 function updatePeerDisplay() {
   syncPeerSummary();
   if (peerText) {
-    peerText.textContent = state.peerName || (state.peerId ? state.peerId : "Waiting");
+    if (!state.joined) {
+      peerText.textContent = "Waiting";
+    } else if (peerContexts.size === 0) {
+      peerText.textContent = "Alone";
+    } else if (peerContexts.size === 1) {
+      peerText.textContent = state.peerName || "1 peer";
+    } else {
+      peerText.textContent = `${peerContexts.size} peers`;
+    }
   }
+  renderParticipantTiles();
+}
+
+function setCtrlButtonLabel(button, label) {
+  if (!button) return;
+  const labelEl = button.querySelector(".ctrl-label");
+  if (labelEl) labelEl.textContent = label;
 }
 
 function updateControls() {
@@ -517,23 +750,26 @@ function updateControls() {
   }
   if (muteButton) {
     muteButton.disabled = !state.joined || !state.localStream;
-    muteButton.textContent = state.muted ? "Unmute" : "Mute";
+    muteButton.classList.toggle("is-active", Boolean(state.muted));
+    muteButton.setAttribute("aria-pressed", state.muted ? "true" : "false");
+    setCtrlButtonLabel(muteButton, state.muted ? "Unmute" : "Mute");
   }
   if (reconnectButton) {
     reconnectButton.disabled = !state.joined || peerContexts.size === 0;
   }
   if (speakerButton) {
     speakerButton.disabled = false;
-    speakerButton.textContent = state.speakerUnlocked ? "Speaker ready" : "Enable speaker";
+    speakerButton.classList.toggle("is-active", Boolean(state.speakerUnlocked));
+    setCtrlButtonLabel(speakerButton, state.speakerUnlocked ? "Ready" : "Speaker");
   }
   if (roleText) {
-    roleText.textContent = state.role || "-";
+    roleText.textContent = state.role || "—";
   }
   if (roomText) {
-    roomText.textContent = state.roomId || "-";
+    roomText.textContent = state.roomId || "—";
   }
   if (localParticipantName) {
-    localParticipantName.textContent = state.displayName || "Microphone source";
+    localParticipantName.textContent = state.displayName || "You";
   }
   updatePeerDisplay();
 }
@@ -2313,12 +2549,10 @@ const codec2 = {
     if (transportModeText) {
       if (this.active) {
         transportModeText.textContent = this.useRelayTransport()
-          ? "Codec2 relay RTP"
-          : "Codec2 compact RTP";
-      } else if (this.isSupported()) {
-        transportModeText.textContent = "Opus fallback";
+          ? "Codec2 · FARGAN relay"
+          : "Codec2 · compact RTP";
       } else {
-        transportModeText.textContent = "Unavailable";
+        transportModeText.textContent = "Opus · WebRTC";
       }
     }
 
@@ -3088,9 +3322,10 @@ const codec2 = {
       this.codec2Track = codec2Track;
       this.codec2Stream = codec2Stream;
       this.sourceNode = source;
-      // Under relay transport (codec2 + FARGAN), force codec2 always-on instead of
-      // only activating it under the "extreme" network profile.
-      this.desiredActive = this.useRelayTransport() || state.audioProfile === "extreme";
+      // Codec2 is gated strictly on relay transport. Without the FARGAN relay
+      // server-side, plain Opus over WebRTC is preferred at every profile —
+      // including "extreme", which becomes Opus@8 kbps rather than codec2 P2P.
+      this.desiredActive = this.useRelayTransport();
 
       if (this.useRelayTransport()) {
         await this.connectRelaySocket();

@@ -2,131 +2,288 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>VoiceAI</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#0a0a0c" />
+    <title>BeyondVoice</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
 
-    <!-- ── Pre-call overlay ── -->
-    <div id="precall" class="precall">
-      <form id="join-form" class="precall-card">
-        <div class="precall-header">
-          <svg class="precall-icon" viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
-          <h1>VoiceAI</h1>
-          <p class="precall-sub">Ultra-light voice calls</p>
+    <!-- ════════════════════════════════════════
+         Unsupported in-app browser blocker
+         (Telegram, FB, IG WebViews break WebRTC)
+         ════════════════════════════════════════ -->
+    <div id="browser-block" class="browser-block" hidden>
+      <div class="browser-block-shell">
+        <div class="browser-block-mark">
+          <span class="wordmark">Beyond<em>Voice</em><span class="wordmark-dot"></span></span>
         </div>
 
-        <div id="mic-panel" class="mic-panel" aria-live="polite">
-          <span id="mic-badge" class="mic-badge mic-badge-pending">Checking</span>
-          <span id="mic-summary" class="mic-summary">Microphone access needed to join.</span>
-          <span id="mic-details" class="mic-detail">Open over HTTPS, then tap Join.</span>
+        <div class="browser-block-card">
+          <div class="browser-block-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"/>
+              <line x1="12" y1="8" x2="12" y2="13"/>
+              <circle cx="12" cy="16.5" r="0.8" fill="currentColor"/>
+            </svg>
+          </div>
+
+          <h2 class="browser-block-title">Open in your real browser</h2>
+          <p class="browser-block-body" id="browser-block-body">
+            <span id="browser-block-app">This in-app browser</span> can't run voice calls. Please open BeyondVoice in <strong>Chrome</strong> or <strong>Safari</strong> instead.
+          </p>
+
+          <div class="browser-block-steps">
+            <div class="browser-block-step">
+              <span class="browser-block-step-num">1</span>
+              <span>Tap the menu (three dots) at the top right</span>
+            </div>
+            <div class="browser-block-step">
+              <span class="browser-block-step-num">2</span>
+              <span>Choose <em>Open in Browser</em> or <em>Open in Safari</em></span>
+            </div>
+          </div>
+
+          <button id="browser-block-copy" type="button" class="btn btn-join browser-block-btn">
+            <span id="browser-block-copy-label">Copy link</span>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+            </svg>
+          </button>
         </div>
-
-        <label class="field">
-          <span>Room</span>
-          <input id="room-input" name="room" type="text" placeholder="demo-room" autocomplete="off" maxlength="48" required />
-        </label>
-
-        <label class="field">
-          <span>Name</span>
-          <input id="name-input" name="name" type="text" placeholder="Your name" autocomplete="nickname" maxlength="32" required />
-        </label>
-
-        <label class="field">
-          <span>Opus Mode</span>
-          <select id="opus-mode-select" name="opus-mode">
-            <option value="saver">Data Saver</option>
-            <option value="balanced">Balanced</option>
-            <option value="quality">High Quality</option>
-          </select>
-          <span id="opus-mode-details" class="field-note">Balanced speech quality and bandwidth.</span>
-        </label>
-
-        <button id="join-button" type="submit" class="btn btn-join">Join room</button>
-      </form>
+      </div>
     </div>
 
-    <!-- ── In-call view ── -->
+    <!-- ════════════════════════════════════════
+         Pre-call overlay
+         ════════════════════════════════════════ -->
+    <div id="precall" class="precall">
+      <div class="precall-shell">
+        <div class="precall-mark">
+          <span class="wordmark">Beyond<em>Voice</em><span class="wordmark-dot"></span></span>
+          <span class="wordmark-tag">Ultra-light voice, anywhere</span>
+        </div>
+
+        <form id="join-form" class="precall-card" novalidate>
+          <div id="mic-panel" class="mic-panel" aria-live="polite">
+            <span id="mic-badge" class="mic-badge mic-badge-pending">Checking</span>
+            <div class="mic-text">
+              <span id="mic-summary" class="mic-summary">Microphone access needed to join.</span>
+              <span id="mic-details" class="mic-detail">Open over HTTPS, then tap Join.</span>
+            </div>
+          </div>
+
+          <label class="field">
+            <span class="field-label">Room</span>
+            <input
+              id="room-input"
+              name="room"
+              type="text"
+              placeholder="demo-room"
+              autocomplete="off"
+              autocapitalize="none"
+              spellcheck="false"
+              maxlength="48"
+              required
+            />
+          </label>
+
+          <label class="field">
+            <span class="field-label">Your name</span>
+            <input
+              id="name-input"
+              name="name"
+              type="text"
+              placeholder="e.g. Ali"
+              autocomplete="nickname"
+              maxlength="32"
+              required
+            />
+          </label>
+
+          <label class="field">
+            <span class="field-label">Audio profile</span>
+            <div class="select-wrap">
+              <select id="opus-mode-select" name="opus-mode">
+                <option value="saver">Data Saver</option>
+                <option value="balanced">Balanced</option>
+                <option value="quality">High Quality</option>
+              </select>
+              <svg class="select-caret" viewBox="0 0 12 8" width="12" height="8" aria-hidden="true">
+                <path d="M1 1.5l5 5 5-5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </div>
+            <span id="opus-mode-details" class="field-note">Balanced speech quality and bandwidth.</span>
+          </label>
+
+          <button id="join-button" type="submit" class="btn btn-join">
+            <span>Join room</span>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <line x1="5" y1="12" x2="19" y2="12"/>
+              <polyline points="13 6 19 12 13 18"/>
+            </svg>
+          </button>
+        </form>
+
+        <p class="precall-foot">
+          Encrypted peer-to-peer · No accounts · No recordings
+        </p>
+      </div>
+    </div>
+
+    <!-- ════════════════════════════════════════
+         In-call view
+         ════════════════════════════════════════ -->
     <main class="call">
 
       <!-- Top bar -->
       <header class="topbar">
-        <div class="topbar-left">
-          <span class="room-label" id="room-text">-</span>
-          <span class="divider">|</span>
-          <span class="status-label" id="status-text">Idle</span>
+        <div class="topbar-brand">
+          <span class="wordmark wordmark-sm">Beyond<em>Voice</em><span class="wordmark-dot"></span></span>
         </div>
-        <div class="topbar-right">
-          <span class="meta-chip" id="role-text">-</span>
-          <button id="info-toggle" type="button" class="icon-btn icon-btn-sm" title="Toggle info panel">
-            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+
+        <div class="topbar-meta">
+          <span class="room-pill">
+            <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M3 9l9-6 9 6v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>
+              <polyline points="9 22 9 12 15 12 15 22"/>
+            </svg>
+            <span id="room-text">—</span>
+          </span>
+          <span class="status-pill" data-status="idle">
+            <span class="status-dot"></span>
+            <span id="status-text">Idle</span>
+          </span>
+        </div>
+
+        <div class="topbar-actions">
+          <span class="role-chip" id="role-text">—</span>
+          <span class="peer-chip" id="peer-text">Waiting</span>
+          <button
+            id="info-toggle"
+            type="button"
+            class="ghost-btn"
+            title="Toggle diagnostics panel"
+            aria-label="Toggle diagnostics panel"
+          >
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="9"/>
+              <line x1="12" y1="16" x2="12" y2="11"/>
+              <circle cx="12" cy="8" r="0.6" fill="currentColor"/>
+            </svg>
           </button>
         </div>
       </header>
 
       <!-- Participant stage -->
-      <section class="stage">
-        <article class="tile tile-local">
-          <div class="tile-avatar">
-            <svg viewBox="0 0 24 24" width="36" height="36" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-          </div>
-          <span class="tile-name" id="local-participant-name">You</span>
-        </article>
-
-        <article class="tile tile-remote">
-          <div class="tile-avatar tile-avatar-remote">
-            <svg viewBox="0 0 24 24" width="36" height="36" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
-          </div>
-          <span class="tile-name" id="peer-text">Waiting</span>
-        </article>
+      <section class="stage" id="stage">
+        <div class="stage-grid" id="stage-grid" data-count="1">
+          <article class="tile tile-local" data-peer-id="__local__">
+            <div class="tile-halo"></div>
+            <div class="tile-body">
+              <div class="tile-avatar tile-avatar-local">
+                <span class="tile-initial" id="local-initial">·</span>
+              </div>
+              <div class="tile-meta">
+                <span class="tile-name" id="local-participant-name">You</span>
+                <span class="tile-role">Local</span>
+              </div>
+            </div>
+            <div class="tile-flags">
+              <span class="tile-flag tile-flag-mute" aria-label="Muted" title="Muted">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <line x1="1" y1="1" x2="23" y2="23"/>
+                  <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6"/>
+                  <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23"/>
+                  <line x1="12" y1="19" x2="12" y2="23"/>
+                </svg>
+              </span>
+            </div>
+          </article>
+          <!-- Remote tiles are reconciled here by app.js renderParticipantTiles() -->
+        </div>
       </section>
 
       <!-- Bottom control bar -->
       <footer class="controls">
-        <button id="mute-button" type="button" class="icon-btn" disabled title="Mute">
-          <svg class="ic-mic" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
-          <span class="btn-label">Mute</span>
-        </button>
+        <div class="controls-cluster">
+          <button id="mute-button" type="button" class="ctrl-btn" disabled aria-label="Mute microphone">
+            <span class="ctrl-icon">
+              <svg class="ic-mic" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="9" y="2" width="6" height="13" rx="3"/>
+                <path d="M19 11v1a7 7 0 0 1-14 0v-1"/>
+                <line x1="12" y1="19" x2="12" y2="23"/>
+                <line x1="8" y1="23" x2="16" y2="23"/>
+              </svg>
+            </span>
+            <span class="ctrl-label">Mute</span>
+          </button>
 
-        <button id="speaker-button" type="button" class="icon-btn" title="Speaker">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
-          <span class="btn-label">Enable speaker</span>
-        </button>
+          <button id="speaker-button" type="button" class="ctrl-btn" aria-label="Toggle speaker">
+            <span class="ctrl-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+                <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+                <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+              </svg>
+            </span>
+            <span class="ctrl-label">Speaker</span>
+          </button>
 
-        <button id="leave-button" type="button" class="icon-btn icon-btn-end" disabled title="Leave">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.68 13.31a16 16 0 0 0 3.41 2.6l1.27-1.27a2 2 0 0 1 2.11-.45 11.94 11.94 0 0 0 3.75.6 2 2 0 0 1 2 2v3.4a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 5.33 2h3.4a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L9.71 9.9"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
-          <span class="btn-label">Leave</span>
-        </button>
+          <button id="reconnect-button" type="button" class="ctrl-btn" disabled aria-label="Reconnect">
+            <span class="ctrl-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="23 4 23 10 17 10"/>
+                <polyline points="1 20 1 14 7 14"/>
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/>
+                <path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/>
+              </svg>
+            </span>
+            <span class="ctrl-label">Reconnect</span>
+          </button>
 
-        <button id="reconnect-button" type="button" class="icon-btn" disabled title="Reconnect">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/><path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/></svg>
-          <span class="btn-label">Reconnect</span>
-        </button>
+          <button id="leave-button" type="button" class="ctrl-btn ctrl-btn-end" disabled aria-label="Leave call">
+            <span class="ctrl-icon">
+              <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21 15.46l-5.27-.61a1.5 1.5 0 0 0-1.32.53l-1.4 1.4a13.5 13.5 0 0 1-6.79-6.79l1.4-1.4a1.5 1.5 0 0 0 .53-1.32L7.54 3a1.5 1.5 0 0 0-1.49-1.32H3.18A1.5 1.5 0 0 0 1.68 3.3 18 18 0 0 0 20.7 22.32a1.5 1.5 0 0 0 1.62-1.5v-2.87A1.5 1.5 0 0 0 21 15.46z" transform="rotate(135 12 12)"/>
+              </svg>
+            </span>
+            <span class="ctrl-label">Leave</span>
+          </button>
+        </div>
       </footer>
 
-      <!-- Side info panel (toggled) -->
-      <aside id="info-panel" class="info-panel hidden">
+      <!-- Diagnostics panel (toggleable) -->
+      <aside id="info-panel" class="info-panel hidden" aria-label="Diagnostics">
+        <div class="info-head">
+          <span class="info-eyebrow">Diagnostics</span>
+          <span class="info-title">Live signal</span>
+        </div>
+
         <div class="panel-section">
           <h3>Network</h3>
           <dl class="metrics">
-            <div class="metric"><dt>RTT</dt><dd id="rtt-text">-</dd></div>
-            <div class="metric"><dt>Jitter</dt><dd id="jitter-text">-</dd></div>
-            <div class="metric"><dt>Loss</dt><dd id="loss-text">-</dd></div>
-            <div class="metric"><dt>Bitrate</dt><dd id="bitrate-text">-</dd></div>
+            <div class="metric"><dt>RTT</dt><dd id="rtt-text">—</dd></div>
+            <div class="metric"><dt>Jitter</dt><dd id="jitter-text">—</dd></div>
+            <div class="metric"><dt>Loss</dt><dd id="loss-text">—</dd></div>
+            <div class="metric"><dt>Bitrate</dt><dd id="bitrate-text">—</dd></div>
           </dl>
         </div>
+
         <div class="panel-section">
-          <h3>Extreme</h3>
+          <h3>Extreme stack</h3>
           <dl class="metrics">
-            <div class="metric"><dt>Transport</dt><dd id="transport-mode-text">-</dd></div>
-            <div class="metric"><dt>Header</dt><dd id="header-text">-</dd></div>
-            <div class="metric"><dt>Buffer</dt><dd id="buffer-text">-</dd></div>
-            <div class="metric"><dt>PLC</dt><dd id="plc-text">-</dd></div>
-            <div class="metric metric-wide"><dt>Vocoder</dt><dd id="vocoder-text">-</dd></div>
+            <div class="metric"><dt>Transport</dt><dd id="transport-mode-text">—</dd></div>
+            <div class="metric"><dt>Header</dt><dd id="header-text">—</dd></div>
+            <div class="metric"><dt>Buffer</dt><dd id="buffer-text">—</dd></div>
+            <div class="metric"><dt>PLC</dt><dd id="plc-text">—</dd></div>
+            <div class="metric metric-wide"><dt>Vocoder</dt><dd id="vocoder-text">—</dd></div>
           </dl>
         </div>
-        <div class="panel-section">
+
+        <div class="panel-section panel-section-log">
           <div class="log-header">
             <h3>Log</h3>
             <button id="clear-log-button" type="button" class="text-btn">Clear</button>
