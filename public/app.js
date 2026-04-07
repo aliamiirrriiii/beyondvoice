@@ -147,7 +147,6 @@ const bufferText = document.querySelector("#buffer-text");
 const plcText = document.querySelector("#plc-text");
 const vocoderText = document.querySelector("#vocoder-text");
 const logOutput = document.querySelector("#log-output");
-const ExtremeStack = window.ExtremeStack || null;
 const peerContexts = new Map();
 
 const state = {
@@ -550,10 +549,6 @@ function getPeerConnections() {
     .filter(Boolean);
 }
 
-function shouldUseCodec2ForCurrentTopology() {
-  return getPeerContexts().length <= 1;
-}
-
 function shouldInitiateOfferForPeer(peerId) {
   const normalizedPeerId = String(peerId || "").trim();
   return Boolean(
@@ -775,26 +770,12 @@ function updateControls() {
 }
 
 async function unlockSpeaker() {
-  // Always try to resume the codec2 AudioContext on a user gesture — under
-  // codec2 relay transport, audio playback goes through the AudioContext,
-  // not through the remoteAudio element, so it must be resumed explicitly.
-  if (codec2.audioContext && codec2.audioContext.state === "suspended") {
-    try {
-      await codec2.audioContext.resume();
-      log("Codec2 AudioContext resumed");
-    } catch (error) {
-      log("Codec2 AudioContext resume failed", { message: error.message });
-    }
-  }
-
   const peerAudioElements = getPeerContexts()
     .map((context) => context.audioElement)
     .filter(Boolean);
 
   if (!remoteAudio && peerAudioElements.length === 0) {
-    state.speakerUnlocked = Boolean(
-      codec2.audioContext && codec2.audioContext.state === "running"
-    );
+    state.speakerUnlocked = false;
     updateControls();
     return;
   }
@@ -808,11 +789,7 @@ async function unlockSpeaker() {
   );
 
   if (playableElements.length === 0) {
-    // No WebRTC remote stream yet, but if codec2 AudioContext is running we
-    // can still consider the speaker unlocked for the relay path.
-    state.speakerUnlocked = Boolean(
-      codec2.audioContext && codec2.audioContext.state === "running"
-    );
+    state.speakerUnlocked = false;
     updateControls();
     return;
   }
@@ -1048,10 +1025,8 @@ async function ensureLocalAudio() {
 
   try {
     // Do NOT force sampleRate/channelCount/sampleSize constraints.
-    // Safari (macOS + iOS) can feed the mic node all-zero buffers when
-    // echoCancellation is enabled and the codec2 worklet graph touches
-    // destination. Keep echo cancellation off there, but leave it on for
-    // other browsers so background noise is reduced in normal relay use.
+    // Safari is more reliable when we avoid forcing capture formats and keep
+    // echo cancellation off. Other browsers still get noise suppression.
     const safariFamily = isSafariFamilyBrowser();
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -1064,16 +1039,6 @@ async function ensureLocalAudio() {
 
     state.localStream = stream;
     localAudio.srcObject = stream;
-    if (codec2.useRelayTransport()) {
-      try {
-        await localAudio.play();
-        log("Local keepalive audio element playing", {
-          track: describeAudioTrack(stream.getAudioTracks()[0] || null)
-        });
-      } catch (error) {
-        log("Local keepalive audio element play deferred", { message: error.message });
-      }
-    }
     setMicStatus(
       "ready",
       "Microphone access is active on this device.",
@@ -1081,7 +1046,6 @@ async function ensureLocalAudio() {
     );
     updateControls();
     log("Local microphone captured", {
-      relayTransport: codec2.useRelayTransport(),
       safariFamily,
       track: describeAudioTrack(stream.getAudioTracks()[0] || null)
     });
@@ -1126,12 +1090,6 @@ function buildWebSocketUrl() {
   return `${protocol}//${window.location.host}${wsPath}`;
 }
 
-function buildMediaWebSocketUrl() {
-  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const wsPath = window.APP_CONFIG?.mediaWsPath || "/media";
-  return `${protocol}//${window.location.host}${wsPath}`;
-}
-
 function closeSignalingSocket() {
   if (state.signalingSocket) {
     state.signalingSocket.onopen = null;
@@ -1151,10 +1109,6 @@ function closeSignalingSocket() {
 }
 
 function closePeerConnection() {
-  // Keep the prewarmed AudioContext alive across reconnects so we don't lose
-  // the original join-button user gesture that allowed it to start.
-  codec2.teardown({ closeAudioContext: false });
-
   for (const context of getPeerContexts()) {
     clearPeerTimers(context);
     if (context.connection) {
@@ -1209,20 +1163,24 @@ function resetStatsDisplay() {
   if (bitrateText) {
     bitrateText.textContent = "-";
   }
+  updateAudioDiagnostics();
+}
+
+function updateAudioDiagnostics() {
   if (transportModeText) {
-    transportModeText.textContent = "-";
+    transportModeText.textContent = "Opus · WebRTC";
   }
   if (headerText) {
-    headerText.textContent = "-";
+    headerText.textContent = `${getActiveAudioProfile().ptime} ms`;
   }
   if (bufferText) {
-    bufferText.textContent = "-";
+    bufferText.textContent = `${getOpusModeConfig().label} · ${getActiveAudioProfile().label}`;
   }
   if (plcText) {
-    plcText.textContent = "-";
+    plcText.textContent = "FEC + DTX";
   }
   if (vocoderText) {
-    vocoderText.textContent = "-";
+    vocoderText.textContent = "Opus 48 kHz";
   }
 }
 
@@ -1275,8 +1233,7 @@ function updateAudioSectionAttribute(section, attribute, value) {
   }
 
   // Insert before any trailing newline(s) so we don't create a blank line
-  // in the SDP body when the audio section is the last m-section
-  // (which happens under codec2 relay transport: no data-channel section is added).
+  // in the SDP body when the audio section is the last m-section.
   const trailing = section.match(/(\r?\n)+$/);
   if (trailing) {
     return `${section.slice(0, -trailing[0].length)}\r\na=${attribute}:${value}${trailing[0]}`;
@@ -1522,12 +1479,7 @@ function pickAudioProfile({
 
 async function adaptAudioCompression(metrics) {
   const nextProfile = pickAudioProfile(metrics);
-  // Under relay transport, codec2/FARGAN is always desired regardless of profile,
-  // but only on single-peer calls because the current codec2 pipeline is singleton.
-  const desiredCodec2 = shouldUseCodec2ForCurrentTopology() &&
-    (codec2.useRelayTransport() || nextProfile === "extreme");
   if (nextProfile === state.audioProfile) {
-    await codec2.setDesiredActive(desiredCodec2);
     return;
   }
 
@@ -1544,23 +1496,7 @@ async function adaptAudioCompression(metrics) {
   });
 
   await applySenderParameters();
-  await codec2.setDesiredActive(desiredCodec2);
-}
-
-async function syncCodec2ForTopology() {
-  if (!shouldUseCodec2ForCurrentTopology()) {
-    codec2.teardown({ closeAudioContext: false });
-    return;
-  }
-
-  const onlyContext = getPeerContexts()[0] || null;
-  if (!onlyContext?.connection || !state.localStream) {
-    return;
-  }
-
-  await codec2.init(onlyContext.connection, state.localStream, {
-    initiator: shouldInitiateOfferForPeer(onlyContext.id)
-  });
+  updateAudioDiagnostics();
 }
 
 function syncPeersFromSnapshot(peers = []) {
@@ -1714,19 +1650,15 @@ async function createPeerConnection(peerId, { replace = false } = {}) {
   };
 
   const stream = await ensureLocalAudio();
-  const useCodec2Transport = shouldUseCodec2ForCurrentTopology() && codec2.useRelayTransport();
   for (const track of stream.getAudioTracks()) {
-    const senderTrack = useCodec2Transport ? track.clone() : track;
-    senderTrack.enabled = !state.muted;
-    const senderStream = senderTrack === track ? stream : new MediaStream([senderTrack]);
-    connection.addTrack(senderTrack, senderStream);
+    track.enabled = !state.muted;
+    connection.addTrack(track, stream);
   }
 
   context.connection = connection;
   context.lastInboundBytes = 0;
   context.lastStatsAt = 0;
   await applySenderParameters();
-  await syncCodec2ForTopology();
   updatePeerDisplay();
   updateStatusFromPeerConnections();
   updateControls();
@@ -1867,7 +1799,6 @@ async function handleRoomSync(message) {
     await createPeerConnection(peer.id);
   }
 
-  await syncCodec2ForTopology();
   updateStatusFromPeerConnections();
 
   for (const peer of peers) {
@@ -2127,7 +2058,6 @@ async function handleEvent(event) {
       updatePeerDisplay();
       log("Peer joined", event.peer);
       await createPeerConnection(event.peer.id);
-      await syncCodec2ForTopology();
       if (shouldInitiateOfferForPeer(event.peer.id)) {
         await createAndSendOffer(event.peer.id);
       }
@@ -2137,7 +2067,6 @@ async function handleEvent(event) {
       log("Peer left", event.peer);
       destroyPeerContext(event.peer.id);
       updatePeerDisplay();
-      await syncCodec2ForTopology();
       updateStatusFromPeerConnections();
       updateControls();
       break;
@@ -2261,11 +2190,6 @@ function startStatsLoop() {
             ? availableOutgoingBitrate / 1000
             : null
       });
-      codec2.updateNetworkMetrics({
-        packetsLost,
-        jitterMs: typeof jitter === "number" ? jitter * 1000 : null,
-        rttMs: typeof rtt === "number" ? rtt * 1000 : null
-      });
     } catch (error) {
       log("Stats collection failed", { message: error.message });
     }
@@ -2282,14 +2206,6 @@ async function joinRoom(event) {
     log("Join blocked: room and name are required");
     return;
   }
-
-  // Synchronously create + resume the codec2 AudioContext while the join-button
-  // user gesture is still active. If we wait until codec2.init runs (after
-  // getUserMedia + several awaits), the gesture is consumed and Chrome's
-  // autoplay policy leaves the context suspended forever — encoder/decoder
-  // worklets never run and audio never flows. This must happen before the
-  // first await in this function.
-  codec2.prewarmAudioContext();
 
   try {
     setMicStatus(
@@ -2367,12 +2283,6 @@ function toggleMute() {
   for (const track of state.localStream.getAudioTracks()) {
     track.enabled = !state.muted;
   }
-  if (codec2.senderTrack && codec2.senderTrack !== codec2.originalTrack) {
-    codec2.senderTrack.enabled = !state.muted;
-  }
-  if (codec2.codec2Track) {
-    codec2.codec2Track.enabled = !state.muted;
-  }
 
   updateControls();
 }
@@ -2429,27 +2339,6 @@ window.addEventListener("beforeunload", () => {
   }
 });
 
-// Aggressive AudioContext rescuer: on ANY user interaction, try to resume any
-// suspended codec2 AudioContext. This is the safety net for the case where the
-// first-joining peer's user-gesture window has long expired by the time the
-// peer-joined event arrives and codec2.init runs.
-function rescueAudioContext() {
-  const ctx = codec2.audioContext;
-  if (!ctx) {
-    return;
-  }
-  if (ctx.state === "suspended") {
-    ctx.resume().then(() => {
-      log("Codec2 AudioContext resumed via gesture rescue", { state: ctx.state });
-    }).catch((error) => {
-      log("Codec2 AudioContext rescue failed", { message: error.message });
-    });
-  }
-}
-["click", "touchstart", "keydown", "pointerdown"].forEach((eventName) => {
-  window.addEventListener(eventName, rescueAudioContext, { capture: true, passive: true });
-});
-
 resetRemoteAudio();
 applyOpusMode(readStoredOpusMode(), { persist: false, resetProfile: true });
 (async () => {
@@ -2478,974 +2367,3 @@ if (precall && joinButton) {
   });
   precallObserver.observe(joinButton, { attributes: true, attributeFilter: ["disabled"] });
 }
-
-// ── Codec2 ultra-low-bitrate transport ──
-// Activated only on the most aggressive profile when both peers finish
-// Codec2 initialization and exchange readiness over a dedicated data channel.
-const codec2 = {
-  active: false,
-  desiredActive: false,
-  localReady: false,
-  peerReady: false,
-  encoderReady: false,
-  decoderReady: false,
-  readyAnnouncementSent: false,
-  encoderNode: null,
-  decoderNode: null,
-  dataChannel: null,
-  audioContext: null,
-  sender: null,
-  originalTrack: null,
-  senderTrack: null,
-  codec2Track: null,
-  codec2Stream: null,
-  sourceNode: null,
-  captureDiag: null,
-  samplesPerFrame: 0,
-  bytesPerFrame: 0,
-  frameDurationMs: 20,
-  packetizer: null,
-  headerCompressor: null,
-  headerDecompressor: null,
-  jitterBuffer: null,
-  plcModel: null,
-  neuralVocoder: null,
-  playoutIntervalId: null,
-  transportStats: null,
-  relaySocket: null,
-  relayReady: false,
-
-  isSupported() {
-    return Boolean(
-      window.APP_CONFIG?.enableCodec2 &&
-      ExtremeStack &&
-      typeof window.AudioContext === "function" &&
-      typeof window.AudioWorkletNode === "function" &&
-      typeof window.WebAssembly === "object"
-    );
-  },
-
-  useRelayTransport() {
-    return Boolean(window.APP_CONFIG?.enableMediaRelay);
-  },
-
-  getNeuralRelayMode() {
-    return String(window.APP_CONFIG?.neuralRelayMode || "off").trim().toLowerCase();
-  },
-
-  resetTransportStats() {
-    this.transportStats = {
-      sentPackets: 0,
-      sentHeaderBytes: 0,
-      sentRawHeaderBytes: 0,
-      receivedPackets: 0,
-      receivedHeaderBytes: 0,
-      receivedRawHeaderBytes: 0,
-      concealedFrames: 0
-    };
-  },
-
-  updateDiagnostics() {
-    if (transportModeText) {
-      if (this.active) {
-        transportModeText.textContent = this.useRelayTransport()
-          ? "Codec2 · FARGAN relay"
-          : "Codec2 · compact RTP";
-      } else {
-        transportModeText.textContent = "Opus · WebRTC";
-      }
-    }
-
-    if (headerText) {
-      if (this.transportStats?.sentPackets) {
-        const averageHeader = this.transportStats.sentHeaderBytes / this.transportStats.sentPackets;
-        const averageRaw = this.transportStats.sentRawHeaderBytes / this.transportStats.sentPackets;
-        headerText.textContent = `${averageHeader.toFixed(1)} / ${averageRaw.toFixed(1)} B`;
-      } else {
-        headerText.textContent = "-";
-      }
-    }
-
-    if (bufferText) {
-      if (this.jitterBuffer) {
-        const stats = this.jitterBuffer.getStats();
-        bufferText.textContent = `${stats.queuedPackets} q / ${stats.targetDelayMs} ms`;
-      } else {
-        bufferText.textContent = "-";
-      }
-    }
-
-    if (plcText) {
-      plcText.textContent = this.transportStats
-        ? String(this.transportStats.concealedFrames)
-        : "-";
-    }
-
-    if (vocoderText) {
-      if (this.useRelayTransport()) {
-        const mode = this.getNeuralRelayMode();
-        const runtime = String(
-          window.APP_CONFIG?.neuralRelayRuntime ||
-          window.APP_CONFIG?.neuralRelayBackend ||
-          "unknown"
-        );
-        vocoderText.textContent =
-          mode === "off"
-            ? `Relay passthrough (${runtime})`
-            : `${mode} relay (${runtime})`;
-      } else {
-        vocoderText.textContent = this.neuralVocoder
-          ? this.neuralVocoder.describe()
-          : "Codec2 decode";
-      }
-    }
-  },
-
-  resetPlayoutState() {
-    if (!ExtremeStack || !this.samplesPerFrame) {
-      return;
-    }
-
-    this.plcModel = new ExtremeStack.FeatureTrajectoryPlcModel({
-      frameSamples: this.samplesPerFrame,
-      sampleRate: 8000
-    });
-    this.jitterBuffer = new ExtremeStack.AdaptiveJitterBuffer({
-      frameDurationMs: this.frameDurationMs,
-      sampleRate: 8000,
-      plcModel: this.plcModel
-    });
-  },
-
-  ensureTransportPipeline() {
-    if (!ExtremeStack || !this.samplesPerFrame || this.packetizer) {
-      return;
-    }
-
-    this.frameDurationMs = Math.max(20, Math.round((this.samplesPerFrame / 8000) * 1000));
-    this.packetizer = new ExtremeStack.RtpPacketizer({
-      payloadType: 97,
-      timestampStep: this.samplesPerFrame
-    });
-    this.headerCompressor = new ExtremeStack.RohcLiteCompressor();
-    this.headerDecompressor = new ExtremeStack.RohcLiteDecompressor();
-    this.neuralVocoder = new ExtremeStack.NeuralVocoderAdapter({
-      mode: "passthrough",
-      label: "Codec2 decoder"
-    });
-    this.resetPlayoutState();
-
-    if (this.playoutIntervalId) {
-      clearInterval(this.playoutIntervalId);
-    }
-    this.playoutIntervalId = window.setInterval(() => {
-      this.drainJitterBuffer();
-    }, Math.max(8, Math.floor(this.frameDurationMs / 2)));
-  },
-
-  postDecodePacket(packet, gain = 1, concealment = false) {
-    if (!this.decoderNode || !packet?.payload?.length) {
-      return;
-    }
-
-    if (packet.payloadType === 98) {
-      const byteLength = packet.payload.length - (packet.payload.length % 2);
-      const pcm = new Float32Array(byteLength / 2);
-      for (let index = 0; index < pcm.length; index += 1) {
-        const lo = packet.payload[index * 2];
-        const hi = packet.payload[index * 2 + 1];
-        let sample = (hi << 8) | lo;
-        if (sample & 0x8000) {
-          sample -= 0x10000;
-        }
-        pcm[index] = sample / 32768;
-      }
-      this.postInjectedPcm({ pcm, gain });
-      return;
-    }
-
-    const payload = packet.payload.slice();
-    this.decoderNode.port.postMessage({
-      type: "decode",
-      data: payload.buffer,
-      gain,
-      concealment,
-      features: packet.features || {}
-    }, [payload.buffer]);
-  },
-
-  postInjectedPcm(frame) {
-    if (!this.decoderNode || !frame?.pcm) {
-      return;
-    }
-
-    const pcm = frame.pcm instanceof Float32Array
-      ? frame.pcm.slice()
-      : new Float32Array(frame.pcm);
-
-    this.decoderNode.port.postMessage({
-      type: "inject-pcm",
-      data: pcm.buffer,
-      gain: frame.gain ?? 1,
-      concealment: true
-    }, [pcm.buffer]);
-  },
-
-  drainJitterBuffer() {
-    if (!this.jitterBuffer || !this.decoderNode) {
-      return;
-    }
-    if (!this.transportStats) {
-      this.resetTransportStats();
-    }
-
-    const frames = this.jitterBuffer.drain(performance.now());
-    for (const frame of frames) {
-      if (frame.concealed) {
-        this.transportStats.concealedFrames += 1;
-      }
-
-      if (frame.kind === "packet") {
-        this.postDecodePacket(frame.packet, frame.gain, frame.concealed);
-      } else if (frame.kind === "pcm") {
-        this.postInjectedPcm(frame);
-      }
-    }
-
-    if (frames.length > 0) {
-      this.updateDiagnostics();
-    }
-  },
-
-  sendEncodedFrame(payload, features = {}) {
-    if (!this.transportStats) {
-      this.resetTransportStats();
-    }
-
-    const sendBinary = (bytes) => {
-      if (this.useRelayTransport()) {
-        if (!this.relaySocket || this.relaySocket.readyState !== WebSocket.OPEN) {
-          return false;
-        }
-        this.relaySocket.send(bytes);
-        return true;
-      }
-
-      if (!this.dataChannel || this.dataChannel.readyState !== "open") {
-        return false;
-      }
-      this.dataChannel.send(bytes);
-      return true;
-    };
-
-    if (!this.packetizer || !this.headerCompressor) {
-      sendBinary(payload);
-      return;
-    }
-
-    const packet = this.packetizer.createPacket(payload, features);
-    const compressed = this.headerCompressor.compress(packet);
-
-    if (!sendBinary(compressed.bytes)) {
-      return;
-    }
-
-    this.transportStats.sentPackets += 1;
-    this.transportStats.sentHeaderBytes += compressed.headerBytes;
-    this.transportStats.sentRawHeaderBytes += compressed.rawHeaderBytes;
-    this.updateDiagnostics();
-  },
-
-  handleIncomingFrame(data) {
-    if (!this.decoderNode) {
-      return;
-    }
-    if (!this.transportStats) {
-      this.resetTransportStats();
-    }
-
-    if (this.headerDecompressor && this.jitterBuffer) {
-      try {
-        const decoded = this.headerDecompressor.decompress(new Uint8Array(data));
-        this.transportStats.receivedPackets += 1;
-        this.transportStats.receivedHeaderBytes += decoded.headerBytes;
-        this.transportStats.receivedRawHeaderBytes += decoded.rawHeaderBytes;
-        this.jitterBuffer.push(decoded.packet, performance.now());
-        this.updateDiagnostics();
-        return;
-      } catch (error) {
-        log("Codec2 compressed packet parse failed", { message: error.message });
-      }
-    }
-
-    this.decoderNode.port.postMessage(
-      { type: "decode", data },
-      [data]
-    );
-  },
-
-  updateNetworkMetrics(metrics) {
-    if (!this.jitterBuffer) {
-      return;
-    }
-
-    this.jitterBuffer.updateNetworkMetrics(metrics);
-    this.updateDiagnostics();
-  },
-
-  closeRelaySocket() {
-    if (!this.relaySocket) {
-      this.relayReady = false;
-      return;
-    }
-
-    this.relaySocket.onopen = null;
-    this.relaySocket.onclose = null;
-    this.relaySocket.onerror = null;
-    this.relaySocket.onmessage = null;
-
-    try {
-      this.relaySocket.close();
-    } catch (error) {
-      log("Codec2 relay socket close skipped", { message: error.message });
-    }
-
-    this.relaySocket = null;
-    this.relayReady = false;
-  },
-
-  async connectRelaySocket() {
-    if (!this.useRelayTransport()) {
-      return;
-    }
-
-    this.closeRelaySocket();
-
-    return new Promise((resolve, reject) => {
-      const socket = new WebSocket(buildMediaWebSocketUrl());
-      socket.binaryType = "arraybuffer";
-      let settled = false;
-
-      socket.onopen = () => {
-        this.relaySocket = socket;
-        socket.send(JSON.stringify({
-          type: "auth",
-          roomId: state.roomId,
-          participantId: state.participantId
-        }));
-      };
-
-      socket.onmessage = (event) => {
-        if (typeof event.data === "string") {
-          try {
-            const message = JSON.parse(event.data);
-            if (message.type === "media-ready") {
-              this.relayReady = true;
-              this.updateDiagnostics();
-              this.syncActiveState().catch((error) => {
-                log("Codec2 relay sync failed", { message: error.message });
-              });
-              if (!settled) {
-                settled = true;
-                resolve();
-              }
-              return;
-            }
-
-            if (message.type === "server-shutdown") {
-              log("Codec2 relay server is restarting");
-            } else if (message.type === "error") {
-              log("Codec2 relay error", { message: message.error });
-            }
-          } catch (error) {
-            log("Codec2 relay control parse failed", { message: error.message });
-          }
-          return;
-        }
-
-        if (event.data instanceof ArrayBuffer) {
-          this.handleIncomingFrame(event.data);
-        }
-      };
-
-      socket.onerror = () => {
-        if (!settled) {
-          settled = true;
-          reject(new Error("Relay WebSocket connection failed"));
-        }
-      };
-
-      socket.onclose = () => {
-        this.relayReady = false;
-        if (this.relaySocket === socket) {
-          this.relaySocket = null;
-        }
-        this.syncActiveState().catch((error) => {
-          log("Codec2 relay close sync failed", { message: error.message });
-        });
-        if (!settled) {
-          settled = true;
-          reject(new Error("Relay WebSocket closed before it connected"));
-        }
-      };
-    });
-  },
-
-  handleWorkerMessage(kind, data) {
-    if (data.type === "error") {
-      log(`Codec2 ${kind} failed`, { message: data.error });
-      this.desiredActive = false;
-      this.syncActiveState().catch((error) => {
-        log("Codec2 deactivation failed", { message: error.message });
-      });
-      return;
-    }
-
-    if (data.type === "log") {
-      log(`Codec2 ${kind} worker`, data);
-      return;
-    }
-
-    if (data.type === "ready") {
-      this.samplesPerFrame = data.samplesPerFrame || this.samplesPerFrame;
-      this.bytesPerFrame = data.bytesPerFrame || this.bytesPerFrame;
-      this.ensureTransportPipeline();
-
-      if (kind === "encoder") {
-        this.encoderReady = true;
-      } else {
-        this.decoderReady = true;
-      }
-
-      if (this.encoderReady && this.decoderReady && !this.localReady) {
-        this.localReady = true;
-        log("Codec2 worklets ready", {
-          mode: data.mode,
-          samplesPerFrame: this.samplesPerFrame,
-          bytesPerFrame: this.bytesPerFrame
-        });
-        this.maybeAnnounceReady();
-        this.syncActiveState().catch((error) => {
-          log("Codec2 activation sync failed", { message: error.message });
-        });
-      }
-      return;
-    }
-
-    if (kind === "encoder" && data.type === "encoded") {
-      // sendEncodedFrame already picks the right transport (relay socket vs data channel).
-      if (this.active) {
-        this.sendEncodedFrame(data.data, data.features || {});
-      }
-    }
-  },
-
-  attachDataChannel(channel) {
-    if (this.dataChannel === channel) {
-      return;
-    }
-
-    this.dataChannel = channel;
-    channel.binaryType = "arraybuffer";
-    channel.onopen = () => {
-      log("Codec2 data channel open");
-      this.maybeAnnounceReady();
-      this.syncActiveState().catch((error) => {
-        log("Codec2 open sync failed", { message: error.message });
-      });
-    };
-    channel.onclose = () => {
-      log("Codec2 data channel closed");
-      this.peerReady = false;
-      this.readyAnnouncementSent = false;
-      this.syncActiveState().catch((error) => {
-        log("Codec2 close sync failed", { message: error.message });
-      });
-    };
-    channel.onerror = () => {
-      log("Codec2 data channel error");
-    };
-    channel.onmessage = (event) => {
-      if (typeof event.data === "string") {
-        try {
-          const message = JSON.parse(event.data);
-          if (message.type === "codec2-ready") {
-            this.peerReady = true;
-            log("Codec2 peer ready", {
-              samplesPerFrame: message.samplesPerFrame,
-              bytesPerFrame: message.bytesPerFrame
-            });
-            this.syncActiveState().catch((error) => {
-              log("Codec2 peer sync failed", { message: error.message });
-            });
-          }
-        } catch (error) {
-          log("Codec2 control message ignored", { message: error.message });
-        }
-        return;
-      }
-
-      if (!(event.data instanceof ArrayBuffer) || !this.decoderNode) {
-        return;
-      }
-
-      this.handleIncomingFrame(event.data);
-    };
-  },
-
-  maybeAnnounceReady() {
-    if (
-      !this.localReady ||
-      !this.dataChannel ||
-      this.dataChannel.readyState !== "open" ||
-      this.readyAnnouncementSent
-    ) {
-      return;
-    }
-
-    this.dataChannel.send(JSON.stringify({
-      type: "codec2-ready",
-      samplesPerFrame: this.samplesPerFrame,
-      bytesPerFrame: this.bytesPerFrame
-    }));
-    this.readyAnnouncementSent = true;
-  },
-
-  async syncActiveState() {
-    const transportReady = this.useRelayTransport()
-      ? Boolean(
-          this.relayReady &&
-          this.relaySocket &&
-          this.relaySocket.readyState === WebSocket.OPEN
-        )
-      : Boolean(
-          this.peerReady &&
-          this.dataChannel &&
-          this.dataChannel.readyState === "open"
-        );
-
-    const shouldBeActive = Boolean(
-      this.desiredActive &&
-      this.localReady &&
-      transportReady &&
-      this.sender &&
-      this.originalTrack
-    );
-
-    if (shouldBeActive === this.active) {
-      return;
-    }
-
-    if (shouldBeActive) {
-      await this.sender.replaceTrack(null);
-      remoteAudio.muted = true;
-      this.resetPlayoutState();
-      this.active = true;
-      log("Codec2 transport active", {
-        samplesPerFrame: this.samplesPerFrame,
-        bytesPerFrame: this.bytesPerFrame
-      });
-      this.updateDiagnostics();
-      return;
-    }
-
-    if (this.sender && this.originalTrack) {
-      await this.sender.replaceTrack(this.originalTrack);
-    }
-    remoteAudio.muted = false;
-    this.active = false;
-    this.resetPlayoutState();
-    log("Codec2 transport inactive");
-    this.updateDiagnostics();
-  },
-
-  async setDesiredActive(enabled) {
-    this.desiredActive = Boolean(enabled);
-    if (!this.isSupported()) {
-      return;
-    }
-    await this.syncActiveState();
-  },
-
-  // Synchronously create the AudioContext during a user gesture (e.g., the
-  // Join button click) so the browser autoplay policy doesn't leave it
-  // suspended once we get to codec2.init() many awaits later. The actual
-  // wasm/worklet loading happens later in init().
-  prewarmAudioContext() {
-    if (!this.isSupported()) {
-      return null;
-    }
-    if (this.audioContext) {
-      // Already exists; just try to resume it (still cheap during a gesture).
-      this.audioContext.resume().catch(() => {});
-      return this.audioContext;
-    }
-    try {
-      // Do NOT force sampleRate: Safari (especially iOS) can't always honor
-      // 48000 and silently outputs nothing if the device's native rate
-      // differs. The codec2 worklet already handles resampling between the
-      // context rate and codec2's 8 kHz internal rate.
-      const audioCtx = new AudioContext();
-      // Synchronous resume call; under a fresh user gesture this transitions
-      // immediately to "running" in Chrome/Safari/Firefox.
-      audioCtx.resume().catch(() => {});
-      this.audioContext = audioCtx;
-      log("Codec2 AudioContext prewarmed", {
-        state: audioCtx.state,
-        sampleRate: audioCtx.sampleRate
-      });
-      return audioCtx;
-    } catch (error) {
-      log("Codec2 AudioContext prewarm failed", { message: error.message });
-      return null;
-    }
-  },
-
-  async init(peerConnection, localStream, { initiator = false } = {}) {
-    // Preserve the prewarmed AudioContext across teardown so we don't lose
-    // the user-gesture origin that allowed it to start.
-    this.teardown({ closeAudioContext: false });
-    if (!this.isSupported()) {
-      return;
-    }
-
-    try {
-      const wasmResponse = await fetch("/codec2.wasm");
-      if (!wasmResponse.ok) {
-        log("Codec2 WASM not found, skipping ultra-low-bitrate mode");
-        return;
-      }
-      // Keep the raw bytes as the canonical payload — structured-cloning a
-      // WebAssembly.Module into AudioWorkletGlobalScope is unreliable on Safari
-      // iOS (the worklet receives undefined and silently no-ops). The worker
-      // accepts either a Module or an ArrayBuffer; we send bytes for safety.
-      const wasmBytes = await wasmResponse.arrayBuffer();
-
-      const audioCtx = (this.audioContext && this.audioContext.state !== "closed")
-        ? this.audioContext
-        : new AudioContext();
-      await audioCtx.resume().catch(() => {});
-      log("Codec2 AudioContext state at init", {
-        state: audioCtx.state,
-        sampleRate: audioCtx.sampleRate
-      });
-      await audioCtx.audioWorklet.addModule("/codec2-worker.js");
-
-      const originalTrack = localStream.getAudioTracks()[0] || null;
-      const senderTrack = peerConnection
-        .getSenders()
-        .find((item) => item.track && item.track.kind === "audio")?.track || null;
-      const codec2Track = originalTrack;
-      const codec2Stream = codec2Track ? new MediaStream([codec2Track]) : localStream;
-      if (codec2Track) {
-        codec2Track.enabled = !state.muted;
-      }
-      log("Codec2 capture graph selected", {
-        relayTransport: this.useRelayTransport(),
-        audioContextSampleRate: audioCtx.sampleRate,
-        originalTrack: describeAudioTrack(originalTrack),
-        senderTrack: describeAudioTrack(senderTrack),
-        codec2Track: describeAudioTrack(codec2Track)
-      });
-
-      // iOS Safari quirk: createMediaStreamSource() yields a node that
-      // delivers no audio unless the same MediaStream is also being consumed
-      // by an HTMLMediaElement that has had .play() called on it. Attach the
-      // local stream to a hidden, muted <audio> element and start it before
-      // wiring up the WebAudio graph. This is a no-op on Chrome/Firefox.
-      try {
-        if (this.iosKeepalivePlayer) {
-          this.iosKeepalivePlayer.pause();
-          this.iosKeepalivePlayer.srcObject = null;
-          this.iosKeepalivePlayer.remove();
-        }
-        const keepalive = document.createElement("audio");
-        keepalive.muted = true;
-        keepalive.setAttribute("playsinline", "");
-        keepalive.setAttribute("autoplay", "");
-        keepalive.style.display = "none";
-        keepalive.srcObject = codec2Stream;
-        document.body.appendChild(keepalive);
-        // play() may reject without a fresh user gesture; that's OK on
-        // browsers that don't need this trick — the catch swallows it.
-        keepalive.play().catch((error) => {
-          log("iOS keepalive audio element play deferred", { message: error.message });
-        });
-        this.iosKeepalivePlayer = keepalive;
-        log("iOS keepalive audio element attached");
-      } catch (error) {
-        log("iOS keepalive audio element setup failed", { message: error.message });
-      }
-
-      // Encoder: local mic → Codec2 → relay
-      // Pass explicit channel options — iOS Safari is buggy with implicit
-      // defaults and may end up with zero-length input/output buses.
-      const encoderNode = new AudioWorkletNode(audioCtx, "codec2-encoder", {
-        numberOfInputs: 1,
-        numberOfOutputs: 1,
-        outputChannelCount: [1],
-        channelCount: 1,
-        channelCountMode: "explicit",
-        channelInterpretation: "speakers"
-      });
-      const source = audioCtx.createMediaStreamSource(codec2Stream);
-      source.connect(encoderNode);
-
-      // === DIAG: capture-chain peak taps ===========================
-      // Two parallel AnalyserNodes (one branched off the same `source`
-      // that feeds the encoder, one created from a separate
-      // MediaStreamAudioSourceNode on the *uncloned* localStream) so we
-      // can pinpoint *where* the silence originates when peakAbs=0:
-      //   - codec2SourcePeak == rawLocalStreamPeak == 0  -> upstream
-      //     of WebAudio (track/device/OS is silent)
-      //   - codec2SourcePeak == 0, rawLocalStreamPeak > 0 -> the clone
-      //     is silent while the original has signal (clone bug)
-      //   - both > 0, but worklet still reports 0 -> source->worklet
-      //     hop is broken
-      // Auto-stops after ~20 seconds to bound log volume.
-      try {
-        const codec2Analyser = audioCtx.createAnalyser();
-        codec2Analyser.fftSize = 2048;
-        codec2Analyser.smoothingTimeConstant = 0;
-        source.connect(codec2Analyser);
-
-        let rawSource = null;
-        let rawAnalyser = null;
-        try {
-          rawSource = audioCtx.createMediaStreamSource(localStream);
-          rawAnalyser = audioCtx.createAnalyser();
-          rawAnalyser.fftSize = 2048;
-          rawAnalyser.smoothingTimeConstant = 0;
-          rawSource.connect(rawAnalyser);
-        } catch (rawErr) {
-          log("Capture diag raw localStream tap failed", { message: rawErr.message });
-        }
-
-        const buf = new Float32Array(2048);
-        const computePeak = (analyser) => {
-          if (!analyser) return null;
-          analyser.getFloatTimeDomainData(buf);
-          let peak = 0;
-          for (let i = 0; i < buf.length; i += 1) {
-            const v = buf[i];
-            const a = v < 0 ? -v : v;
-            if (a > peak) peak = a;
-          }
-          return peak;
-        };
-
-        let ticks = 0;
-        const intervalId = setInterval(() => {
-          ticks += 1;
-          const codec2Peak = computePeak(codec2Analyser);
-          const rawPeak = computePeak(rawAnalyser);
-          const origTrack = originalTrack;
-          const cloneTrack = codec2Track;
-          log("Capture diag peaks", {
-            tick: ticks,
-            codec2SourcePeak: codec2Peak !== null ? codec2Peak.toFixed(6) : "n/a",
-            rawLocalStreamPeak: rawPeak !== null ? rawPeak.toFixed(6) : "n/a",
-            ctxState: audioCtx.state,
-            ctxTime: audioCtx.currentTime.toFixed(2),
-            origMuted: origTrack ? origTrack.muted : null,
-            origEnabled: origTrack ? origTrack.enabled : null,
-            origReadyState: origTrack ? origTrack.readyState : null,
-            cloneMuted: cloneTrack ? cloneTrack.muted : null,
-            cloneEnabled: cloneTrack ? cloneTrack.enabled : null,
-            cloneReadyState: cloneTrack ? cloneTrack.readyState : null
-          });
-          if (ticks >= 20) {
-            clearInterval(intervalId);
-            try { source.disconnect(codec2Analyser); } catch (cleanupErr) {}
-            if (rawSource) { try { rawSource.disconnect(); } catch (cleanupErr) {} }
-            log("Capture diag finished (20 ticks)");
-            codec2.captureDiag = null;
-          }
-        }, 1000);
-
-        this.captureDiag = { intervalId, codec2Analyser, rawSource, rawAnalyser };
-        log("Capture diag taps installed");
-      } catch (diagErr) {
-        log("Capture diag setup failed", { message: diagErr.message });
-      }
-      // === END DIAG =================================================
-
-      // Keep the encoder reachable from destination so Safari schedules
-      // process() on the worklet, but DO NOT route the mic source itself
-      // to destination — that creates an AEC-detected loopback that makes
-      // Safari deliver all-zero buffers to the mic node (peakAbs=0).
-      // The encoder's outputs are silence (it writes zeros every tick), so
-      // routing through this gain=0 path is purely a "node liveness" hint.
-      const encoderSilencer = audioCtx.createGain();
-      encoderSilencer.gain.value = 0;
-      encoderNode.connect(encoderSilencer);
-      encoderSilencer.connect(audioCtx.destination);
-      encoderNode.port.onmessage = (e) => this.handleWorkerMessage("encoder", e.data);
-      // Send a fresh slice each time so neither worker can transfer-detach
-      // the other's buffer.
-      encoderNode.port.postMessage({ type: "init", bytes: wasmBytes.slice(0) });
-
-      // Decoder: relay → Codec2 → speaker
-      const decoderNode = new AudioWorkletNode(audioCtx, "codec2-decoder", {
-        numberOfInputs: 1,
-        numberOfOutputs: 1,
-        outputChannelCount: [1],
-        channelCount: 1,
-        channelCountMode: "explicit",
-        channelInterpretation: "speakers"
-      });
-      decoderNode.connect(audioCtx.destination);
-      decoderNode.port.onmessage = (e) => this.handleWorkerMessage("decoder", e.data);
-      decoderNode.port.postMessage({ type: "init", bytes: wasmBytes.slice(0) });
-
-      // iOS Safari "audio render thread won't start" workaround: briefly
-      // start and stop a silent oscillator. This forces the audio context's
-      // render quantum loop to actually start, which then begins scheduling
-      // process() on the worklet nodes. No-op on Chrome/Firefox.
-      try {
-        const kicker = audioCtx.createOscillator();
-        const kickerGain = audioCtx.createGain();
-        kickerGain.gain.value = 0;
-        kicker.connect(kickerGain).connect(audioCtx.destination);
-        kicker.start();
-        kicker.stop(audioCtx.currentTime + 0.05);
-        log("iOS audio render thread kicker started");
-      } catch (error) {
-        log("iOS audio render kicker skipped", { message: error.message });
-      }
-
-      this.sender = peerConnection
-        .getSenders()
-        .find((item) => item.track && item.track.kind === "audio") || null;
-      this.originalTrack = originalTrack;
-      this.senderTrack = senderTrack;
-      this.codec2Track = codec2Track;
-      this.codec2Stream = codec2Stream;
-      this.sourceNode = source;
-      // Codec2 is gated strictly on relay transport. Without the FARGAN relay
-      // server-side, plain Opus over WebRTC is preferred at every profile —
-      // including "extreme", which becomes Opus@8 kbps rather than codec2 P2P.
-      this.desiredActive = this.useRelayTransport();
-
-      if (this.useRelayTransport()) {
-        await this.connectRelaySocket();
-      } else {
-        peerConnection.ondatachannel = (event) => {
-          if (event.channel.label === "codec2") {
-            this.attachDataChannel(event.channel);
-          }
-        };
-
-        if (initiator) {
-          const channel = peerConnection.createDataChannel("codec2", {
-            ordered: false,
-            maxRetransmits: 0
-          });
-          this.attachDataChannel(channel);
-        }
-      }
-
-      this.encoderNode = encoderNode;
-      this.decoderNode = decoderNode;
-      this.audioContext = audioCtx;
-      this.resetTransportStats();
-      log("Codec2 transport initialized");
-      this.updateDiagnostics();
-    } catch (error) {
-      log("Codec2 init failed, using Opus", { message: error.message });
-      this.teardown();
-    }
-  },
-
-  teardown({ closeAudioContext = true } = {}) {
-    this.desiredActive = false;
-    if (this.sender && this.originalTrack && this.active) {
-      this.sender.replaceTrack(this.senderTrack || this.originalTrack).catch(() => {});
-    }
-    this.active = false;
-    this.localReady = false;
-    this.peerReady = false;
-    this.encoderReady = false;
-    this.decoderReady = false;
-    this.readyAnnouncementSent = false;
-    this.samplesPerFrame = 0;
-    this.bytesPerFrame = 0;
-    this.frameDurationMs = 20;
-    this.relayReady = false;
-    remoteAudio.muted = false;
-    if (this.playoutIntervalId) {
-      clearInterval(this.playoutIntervalId);
-      this.playoutIntervalId = null;
-    }
-    if (this.audioContext && closeAudioContext) {
-      this.audioContext.close().catch(() => {});
-    }
-    if (this.dataChannel) {
-      this.dataChannel.onopen = null;
-      this.dataChannel.onclose = null;
-      this.dataChannel.onerror = null;
-      this.dataChannel.onmessage = null;
-      this.dataChannel.close();
-    }
-    this.closeRelaySocket();
-    if (this.iosKeepalivePlayer) {
-      try {
-        this.iosKeepalivePlayer.pause();
-        this.iosKeepalivePlayer.srcObject = null;
-        this.iosKeepalivePlayer.remove();
-      } catch (error) {
-        // best-effort cleanup
-      }
-      this.iosKeepalivePlayer = null;
-    }
-    if (this.sourceNode) {
-      try {
-        this.sourceNode.disconnect();
-      } catch (error) {
-        // best-effort cleanup
-      }
-      this.sourceNode = null;
-    }
-    if (this.captureDiag) {
-      try {
-        clearInterval(this.captureDiag.intervalId);
-      } catch (error) {
-        // best-effort cleanup
-      }
-      if (this.captureDiag.rawSource) {
-        try {
-          this.captureDiag.rawSource.disconnect();
-        } catch (error) {
-          // best-effort cleanup
-        }
-      }
-      this.captureDiag = null;
-    }
-    if (this.senderTrack && this.senderTrack !== this.originalTrack) {
-      try {
-        this.senderTrack.stop();
-      } catch (error) {
-        // best-effort cleanup
-      }
-    }
-    this.encoderNode = null;
-    this.decoderNode = null;
-    this.dataChannel = null;
-    if (closeAudioContext) {
-      this.audioContext = null;
-    }
-    this.sender = null;
-    this.originalTrack = null;
-    this.senderTrack = null;
-    this.codec2Track = null;
-    this.codec2Stream = null;
-    this.packetizer = null;
-    this.headerCompressor = null;
-    this.headerDecompressor = null;
-    this.jitterBuffer = null;
-    this.plcModel = null;
-    this.neuralVocoder = null;
-    this.resetTransportStats();
-    this.updateDiagnostics();
-  }
-};

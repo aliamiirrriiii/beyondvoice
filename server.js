@@ -350,9 +350,6 @@ function appConfigScript({
   neuralRelayBackend = "disabled",
   neuralRelayRuntime = "disabled"
 } = {}) {
-  const codec2Available =
-    fs.existsSync(path.join(PUBLIC_DIR, "codec2.wasm")) &&
-    fs.existsSync(path.join(PUBLIC_DIR, "codec2-worker.js"));
   const config = {
     iceServers: buildIceServers().filter((server) => {
       const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
@@ -361,12 +358,15 @@ function appConfigScript({
     maxReconnectDelayMs: 15000,
     wsPath: "/ws",
     mediaWsPath: "/media",
-    enableCodec2: codec2Available,
-    enableMediaRelay: codec2Available && ENABLE_MEDIA_RELAY,
+    // The browser call path is intentionally Opus-only. Legacy Codec2/FARGAN
+    // code remains in-tree for server-side/native experiments and tests, but
+    // the client must never detach the WebRTC Opus track in production.
+    enableCodec2: false,
+    enableMediaRelay: false,
     enableRemoteDebugLogs: ENABLE_REMOTE_DEBUG_LOGS,
-    neuralRelayMode: codec2Available ? neuralRelayMode : "off",
-    neuralRelayBackend: codec2Available ? neuralRelayBackend : "disabled",
-    neuralRelayRuntime: codec2Available ? neuralRelayRuntime : "disabled"
+    neuralRelayMode: "off",
+    neuralRelayBackend: "disabled",
+    neuralRelayRuntime: "disabled"
   };
 
   return `window.APP_CONFIG = ${JSON.stringify(config, null, 2)};`;

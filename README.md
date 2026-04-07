@@ -4,13 +4,13 @@ Two-person browser voice calling with:
 
 - WebRTC audio transport
 - aggressive Opus compression tuning
-- optional Codec2 extreme mode with compact RTP packetization, header compression, adaptive jitter buffering, and PLC hooks
-- server-side relay media path for Codec2 extreme mode over `/media` WebSocket
 - WebSocket signaling and static serving
 - Redis-backed shared room state
 - coturn relay service with ephemeral credentials
 - optional browser-native HTTP Basic auth gate
 - Docker Compose deployment support for Traefik
+
+The shipped browser client is Opus-only. Legacy relay and native audio experiments remain in-tree for backend testing.
 
 ## Production status
 
@@ -211,9 +211,9 @@ The service is deployable now, but these are still the next high-value improveme
 4. add TLS-enabled `turns:` on `5349` if your target networks require it
 5. use managed or geographically distributed TURN infrastructure if you need global reach
 
-## Extreme mode roadmap status
+## Legacy relay roadmap
 
-The repository now includes an internal "extreme transport" path for the optional Codec2 data-channel mode:
+The repository still contains an internal Codec2 relay transport prototype for backend experiments and tests. The current browser client does not use this path.
 
 - RTP-like packet sequencing and timestamps for Codec2 frames
 - compact ROHC-style header compression for the packet headers
@@ -230,9 +230,9 @@ What is still required for the full target stack described in the roadmap:
 2. optionally export native Codec2 parameters such as LSPs/pitch directly from the codec build instead of deriving neural features from relay-side decoded PCM
 3. move the transport to a native/mobile UDP path if you want real ROHC over IP/UDP/RTP instead of the current browser/WebSocket approximation
 
-## Relay architecture
+## Historical relay architecture
 
-The new relay path is built for the browser-first version of this project:
+This describes the older experimental relay path, not the current shipped browser call flow:
 
 1. the sender browser encodes mic audio into Codec2 frames
 2. the browser packetizes and compresses those frames, then sends them to `/media`
@@ -245,7 +245,7 @@ This keeps the heaviest transport repair logic off the recipient device without 
 
 ## Neural relay modes
 
-The relay now exposes a pluggable neural-processing stage behind a stable interface. It is opt-in: set `ENABLE_MEDIA_RELAY=true` when you explicitly want the Codec2 relay transport.
+The relay exposes a pluggable neural-processing stage behind a stable interface for backend experiments. The browser client remains Opus/WebRTC only even if these modes are enabled on the server.
 
 - `NEURAL_RELAY_MODE=off`
   Plain relay pass-through. Jitter buffering and transport repair stay enabled.
