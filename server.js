@@ -78,7 +78,7 @@ function securityHeaders(contentType = "text/plain; charset=utf-8", cacheControl
     "Referrer-Policy": "no-referrer",
     "Permissions-Policy": "microphone=(self), camera=(), geolocation=()",
     "Content-Security-Policy":
-      "default-src 'self'; connect-src 'self' ws: wss:; script-src 'self'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+      "default-src 'self'; connect-src 'self' ws: wss:; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; media-src 'self' blob:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
   };
 }
 
@@ -473,11 +473,6 @@ function createMemoryStore(publishEvent) {
 
       await pruneRoom(room.id);
       const liveParticipants = Array.from(room.participants.values());
-      if (liveParticipants.length >= 2) {
-        const error = new Error("Room is full");
-        error.statusCode = 409;
-        throw error;
-      }
 
       const participant = {
         id: randomId("peer"),
@@ -635,11 +630,6 @@ function createRedisStore(commandClient, publishEvent) {
 
       await pruneRoom(normalizedRoomId);
       const liveParticipants = await listParticipants(normalizedRoomId);
-      if (liveParticipants.length >= 2) {
-        const error = new Error("Room is full");
-        error.statusCode = 409;
-        throw error;
-      }
 
       const participant = {
         id: randomId("peer"),
@@ -956,6 +946,7 @@ async function main() {
     neuralRelayMode: neuralRelay.mode,
     neuralRelayBackend: neuralRelay.backend
   });
+  const deliverFrameCounters = new Map();
   const mediaRelay = new MediaRelayController({
     neuralRelay,
     frameDurationMs: 40,
@@ -971,6 +962,11 @@ async function main() {
         .filter((participantId) => mediaSocketsByParticipant.has(participantId));
     },
     deliverFrame: (targetId, bytes) => {
+      const counter = (deliverFrameCounters.get(targetId) || 0) + 1;
+      deliverFrameCounters.set(targetId, counter);
+      if (counter === 1 || counter % 100 === 0) {
+        console.log("[MEDIA] deliverFrame", { target: targetId, count: counter, bytes: bytes.length });
+      }
       relayMediaFrame(targetId, bytes).catch((error) => {
         console.error("Failed to relay media frame", error);
       });
@@ -1066,6 +1062,30 @@ async function main() {
         neuralRelayMode: neuralRelay.mode,
         neuralRelayBackend: neuralRelay.backend
       });
+      return true;
+    }
+
+    // Client-log forwarder: each browser POSTs its in-page log entries here
+    // so we can monitor live without asking users to copy/paste. Best-effort,
+    // never blocks the response.
+    if (url.pathname === "/api/debug/log" && request.method === "POST") {
+      readJsonBody(request)
+        .then((body) => {
+          const peer = String(body?.peer || "?").slice(0, 64);
+          const room = String(body?.room || "?").slice(0, 64);
+          const ua = String(body?.ua || "?").slice(0, 200);
+          const entries = Array.isArray(body?.entries) ? body.entries : [];
+          for (const entry of entries) {
+            const message = String(entry?.message || "").slice(0, 500);
+            const ctx = entry?.context;
+            const ctxStr = ctx ? " " + JSON.stringify(ctx).slice(0, 800) : "";
+            console.log("[CLIENT-LOG]", `peer=${peer}`, `room=${room}`, `ua=${ua.slice(0, 30)}`, "::", message + ctxStr);
+          }
+          json(response, 204, {});
+        })
+        .catch(() => {
+          json(response, 400, { error: "bad client log payload" });
+        });
       return true;
     }
 
@@ -1231,6 +1251,7 @@ async function main() {
     }
 
     registerMediaSocket(ws, roomId, participantId);
+    console.log("[MEDIA] auth ok", { room: roomId, peer: participantId });
     sendSocketMessage(ws, {
       type: "media-ready",
       roomId,
@@ -1283,6 +1304,14 @@ async function main() {
             }
 
             await store.touchParticipant(ws.roomId, ws.participantId);
+            console.log("[SIGNAL]", { from: ws.participantId, to: message.targetId, type: message.signalType });
+            if (message.signalType === "offer" || message.signalType === "answer") {
+              const sdpStr = message?.payload?.description?.sdp || "";
+              const lines = sdpStr.split(/\r?\n/);
+              const blanks = lines.map((l, i) => [l, i]).filter(([l, i]) => i < lines.length - 1 && l === "");
+              console.log("[SIGNAL]", message.signalType, "sdp_lines=" + lines.length, "blanks_mid_body=" + blanks.length);
+              console.log("[SDP-DUMP-" + message.signalType.toUpperCase() + "-BEGIN]\n" + sdpStr + "\n[SDP-DUMP-END]");
+            }
             await store.publishSignal(ws.roomId, ws.participantId, message.targetId, {
               type: message.signalType,
               payload: message.payload || {}
@@ -1311,6 +1340,9 @@ async function main() {
     ws.isAlive = true;
     ws.participantId = "";
     ws.roomId = "";
+    ws.__mediaFrameCount = 0;
+    ws.__mediaFirstFrameAt = 0;
+    console.log("[MEDIA] connection opened");
 
     ws.on("pong", () => {
       ws.isAlive = true;
@@ -1319,14 +1351,23 @@ async function main() {
     ws.on("message", async (rawMessage, isBinary) => {
       if (isBinary) {
         if (!ws.roomId || !ws.participantId) {
+          console.log("[MEDIA] binary frame before auth, dropping");
           sendSocketMessage(ws, { type: "error", error: "Media socket is not authenticated" });
           return;
         }
 
         try {
           await store.touchParticipant(ws.roomId, ws.participantId);
+          ws.__mediaFrameCount += 1;
+          if (ws.__mediaFrameCount === 1) {
+            ws.__mediaFirstFrameAt = Date.now();
+            console.log("[MEDIA] first uplink frame", { room: ws.roomId, peer: ws.participantId, bytes: rawMessage.length });
+          } else if (ws.__mediaFrameCount % 100 === 0) {
+            console.log("[MEDIA] uplink frames", { peer: ws.participantId, count: ws.__mediaFrameCount });
+          }
           mediaRelay.receiveCompressedFrame(ws.roomId, ws.participantId, new Uint8Array(rawMessage));
         } catch (error) {
+          console.log("[MEDIA] receiveCompressedFrame error", error.message);
           sendSocketMessage(ws, { type: "error", error: error.message });
         }
         return;
@@ -1381,13 +1422,17 @@ async function main() {
   });
 
   server.on("upgrade", (request, socket, head) => {
+    const upath = request.url || "";
+    console.log("[UPGRADE]", { path: upath, origin: request.headers.origin || "" });
     if (isShuttingDown) {
+      console.log("[UPGRADE] reject: shutting down");
       socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
       socket.destroy();
       return;
     }
 
     if (!isAuthenticatedRequest(request)) {
+      console.log("[UPGRADE] reject: 401 unauth", upath);
       socket.write(
         "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"VoiceAI\", charset=\"UTF-8\"\r\n\r\n"
       );
@@ -1396,6 +1441,7 @@ async function main() {
     }
 
     if (!allowRequest(request)) {
+      console.log("[UPGRADE] reject: 429");
       socket.write("HTTP/1.1 429 Too Many Requests\r\n\r\n");
       socket.destroy();
       return;
@@ -1403,12 +1449,14 @@ async function main() {
 
     const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
     if (url.pathname !== "/ws" && url.pathname !== "/media") {
+      console.log("[UPGRADE] reject: 404", url.pathname);
       socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
       socket.destroy();
       return;
     }
 
     if (allowedOrigin && request.headers.origin !== allowedOrigin) {
+      console.log("[UPGRADE] reject: 403 origin mismatch", { got: request.headers.origin, want: allowedOrigin });
       socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
       socket.destroy();
       return;

@@ -98,7 +98,7 @@ function extractFrameFeatures(frame) {
   };
 }
 
-function instantiateCodec2Module(wasmModule) {
+async function instantiateCodec2Module(wasmModuleOrBytes) {
   const wasi = {
     fd_close() {
       return 0;
@@ -111,16 +111,36 @@ function instantiateCodec2Module(wasmModule) {
     }
   };
 
-  return WebAssembly.instantiate(wasmModule, {
-    wasi_snapshot_preview1: wasi
-  }).then((result) => {
-    const instance = result.instance || result;
-    const exports = instance.exports;
-    if (typeof exports._initialize === "function") {
-      exports._initialize();
-    }
-    return exports;
-  });
+  let result;
+  if (wasmModuleOrBytes instanceof WebAssembly.Module) {
+    // Fast path: caller already compiled the module (Chrome/Firefox).
+    result = await WebAssembly.instantiate(wasmModuleOrBytes, {
+      wasi_snapshot_preview1: wasi
+    });
+  } else if (
+    wasmModuleOrBytes instanceof ArrayBuffer ||
+    (wasmModuleOrBytes && wasmModuleOrBytes.buffer instanceof ArrayBuffer)
+  ) {
+    // Safari path: structured-clone of WebAssembly.Module is unreliable in
+    // AudioWorkletGlobalScope on Safari iOS, so the main thread sends raw
+    // bytes and we compile + instantiate here.
+    const bytes = wasmModuleOrBytes instanceof ArrayBuffer
+      ? wasmModuleOrBytes
+      : wasmModuleOrBytes.buffer;
+    const compiled = await WebAssembly.compile(bytes);
+    result = await WebAssembly.instantiate(compiled, {
+      wasi_snapshot_preview1: wasi
+    });
+  } else {
+    throw new Error("Invalid codec2 wasm payload (expected Module or ArrayBuffer)");
+  }
+
+  const instance = result.instance || result;
+  const exports = instance.exports;
+  if (typeof exports._initialize === "function") {
+    exports._initialize();
+  }
+  return exports;
 }
 
 class Codec2Encoder extends AudioWorkletProcessor {
@@ -137,8 +157,17 @@ class Codec2Encoder extends AudioWorkletProcessor {
   }
 
   _onMessage(msg) {
-    if (msg.type === "init" && msg.module) {
-      this._initWasm(msg.module).catch((err) => {
+    if (msg.type === "init") {
+      const payload = msg.module || msg.bytes;
+      if (!payload) {
+        this.port.postMessage({
+          type: "error",
+          error: "init message missing both 'module' and 'bytes'"
+        });
+        return;
+      }
+      this.port.postMessage({ type: "log", stage: "init-received", hasModule: !!msg.module, hasBytes: !!msg.bytes });
+      this._initWasm(payload).catch((err) => {
         this.port.postMessage({ type: "error", error: err.message });
       });
     }
@@ -180,15 +209,93 @@ class Codec2Encoder extends AudioWorkletProcessor {
     return downsampled;
   }
 
-  process(inputs) {
-    if (!this.ready || !inputs[0] || !inputs[0][0]) return true;
+  process(inputs, outputs) {
+    this._processCallCount = (this._processCallCount || 0) + 1;
 
-    const downsampled = this._downsample(inputs[0][0]);
+    // iOS Safari quirk: a worklet whose process() never writes anything to
+    // its output buffers may have its process() callback stop being scheduled
+    // entirely. Write silence to all output channels every call so Safari
+    // keeps invoking us even though the encoder's "real" output is the
+    // postMessage stream of encoded frames, not the audio graph.
+    if (outputs && outputs[0]) {
+      const outBus = outputs[0];
+      for (let ch = 0; ch < outBus.length; ch += 1) {
+        const outChan = outBus[ch];
+        if (outChan) {
+          outChan.fill(0);
+        }
+      }
+    }
+
+    // Diagnostic: report the very first process() call so we can confirm the
+    // worklet is actually being scheduled, and report periodically once we
+    // start dropping inputs (which is the iOS-Safari createMediaStreamSource
+    // failure mode).
+    if (this._processCallCount === 1) {
+      this.port.postMessage({
+        type: "log",
+        stage: "process-first-call",
+        ready: this.ready,
+        hasInputs: !!inputs,
+        inputsLen: inputs ? inputs.length : 0,
+        bus0Len: inputs && inputs[0] ? inputs[0].length : 0,
+        firstChannelLen: inputs && inputs[0] && inputs[0][0] ? inputs[0][0].length : 0
+      });
+    }
+
+    if (!this.ready) {
+      if (this._processCallCount % 200 === 0) {
+        this.port.postMessage({ type: "log", stage: "process-not-ready", calls: this._processCallCount });
+      }
+      return true;
+    }
+
+    if (!inputs[0] || !inputs[0][0] || inputs[0][0].length === 0) {
+      this._noInputCount = (this._noInputCount || 0) + 1;
+      if (this._noInputCount === 1 || this._noInputCount % 500 === 0) {
+        this.port.postMessage({
+          type: "log",
+          stage: "process-no-input",
+          calls: this._processCallCount,
+          noInputCount: this._noInputCount,
+          inputsLen: inputs ? inputs.length : 0,
+          bus0Len: inputs && inputs[0] ? inputs[0].length : 0
+        });
+      }
+      return true;
+    }
+
+    // Detect "input present but silent" — buffer is the right size but every
+    // sample is zero. That's a different failure than "no buffer at all".
+    const inputBuf = inputs[0][0];
+    if (this._processCallCount % 500 === 0) {
+      let nonZero = 0;
+      let peakAbs = 0;
+      for (let i = 0; i < inputBuf.length; i += 1) {
+        const v = inputBuf[i];
+        if (v !== 0) nonZero += 1;
+        const a = v < 0 ? -v : v;
+        if (a > peakAbs) peakAbs = a;
+      }
+      this.port.postMessage({
+        type: "log",
+        stage: "process-tick",
+        calls: this._processCallCount,
+        encodedFrames: this._encodedFrameCount || 0,
+        bufferLen: this.buffer.length,
+        inputLen: inputBuf.length,
+        nonZero,
+        peakAbs
+      });
+    }
+
+    const downsampled = this._downsample(inputBuf);
     this.buffer.push(...downsampled);
 
     while (this.buffer.length >= this.frameSamples) {
       const frame = Float32Array.from(this.buffer.splice(0, this.frameSamples));
       this._encodeFrame(frame);
+      this._encodedFrameCount = (this._encodedFrameCount || 0) + 1;
     }
 
     return true;
@@ -225,8 +332,17 @@ class Codec2Decoder extends AudioWorkletProcessor {
   }
 
   _onMessage(msg) {
-    if (msg.type === "init" && msg.module) {
-      this._initWasm(msg.module).catch((err) => {
+    if (msg.type === "init") {
+      const payload = msg.module || msg.bytes;
+      if (!payload) {
+        this.port.postMessage({
+          type: "error",
+          error: "init message missing both 'module' and 'bytes'"
+        });
+        return;
+      }
+      this.port.postMessage({ type: "log", stage: "init-received", hasModule: !!msg.module, hasBytes: !!msg.bytes });
+      this._initWasm(payload).catch((err) => {
         this.port.postMessage({ type: "error", error: err.message });
       });
     } else if (msg.type === "decode" && msg.data) {

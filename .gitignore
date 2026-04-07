@@ -4,3 +4,4 @@ certs/
 *.log
 native/fargan-relay/bin/fargan-relay-worker-native
 native/fargan-relay/build/
+.env

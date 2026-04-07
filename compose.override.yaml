@@ -1,0 +1,5 @@
+services:
+  voiceai:
+    environment:
+      NEURAL_RELAY_MODE: fargan
+      NEURAL_RELAY_BACKEND: in-process

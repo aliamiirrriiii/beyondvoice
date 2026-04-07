@@ -50,11 +50,11 @@ services:
       start_period: 10s
     labels:
       traefik.enable: "true"
-      traefik.docker.network: ${TRAEFIK_NETWORK:-traefik-public}
+      traefik.docker.network: ${TRAEFIK_NETWORK:-traefik}
       traefik.http.routers.voiceai.rule: Host(`${VOICEAI_HOST:?VOICEAI_HOST must be set}`)
       traefik.http.routers.voiceai.entrypoints: websecure
       traefik.http.routers.voiceai.tls: "true"
-      traefik.http.routers.voiceai.tls.certresolver: ${TRAEFIK_CERTRESOLVER:-letsencrypt}
+      traefik.http.routers.voiceai.tls.certresolver: ${TRAEFIK_CERTRESOLVER:-cfletsencrypt}
       traefik.http.routers.voiceai.service: voiceai
       traefik.http.services.voiceai.loadbalancer.server.port: "3000"
       traefik.http.middlewares.voiceai-compress.compress: "true"
@@ -66,7 +66,7 @@ services:
       traefik.http.routers.voiceai.middlewares: voiceai-compress,voiceai-headers
     networks:
       - default
-      - traefik-public
+      - traefik
 
   redis:
     image: redis:7-alpine
@@ -89,27 +89,36 @@ services:
       - -n
       - --log-file=stdout
       - --fingerprint
-      - --lt-cred-mech
       - --use-auth-secret
       - --static-auth-secret=${TURN_AUTH_SECRET:?TURN_AUTH_SECRET must be set}
       - --realm=${TURN_REALM:?TURN_REALM must be set}
       - --listening-ip=0.0.0.0
       - --external-ip=${TURN_EXTERNAL_IP:?TURN_EXTERNAL_IP must be set}
+      - --relay-ip=${TURN_EXTERNAL_IP:?TURN_EXTERNAL_IP must be set}
       - --listening-port=3478
       - --min-port=${TURN_MIN_PORT:-49160}
       - --max-port=${TURN_MAX_PORT:-49200}
       - --stale-nonce
       - --no-cli
-      - --no-loopback-peers
-      - --no-multicast-peers
+      - --denied-peer-ip=0.0.0.0-0.255.255.255
+      - --denied-peer-ip=10.0.0.0-10.255.255.255
+      - --denied-peer-ip=127.0.0.0-127.255.255.255
+      - --denied-peer-ip=172.16.0.0-172.31.255.255
+      - --denied-peer-ip=192.168.0.0-192.168.255.255
+      - --denied-peer-ip=224.0.0.0-239.255.255.255
       - --user-quota=${TURN_USER_QUOTA:-12}
       - --total-quota=${TURN_TOTAL_QUOTA:-120}
-    ports:
-      - "${TURN_PORT:-3478}:3478/tcp"
-      - "${TURN_PORT:-3478}:3478/udp"
-      - "${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}:${TURN_MIN_PORT:-49160}-${TURN_MAX_PORT:-49200}/udp"
+      - --no-tlsv1
+      - --no-tlsv1_1
+      - --no-rfc5780
+      - --no-stun-backward-compatibility
+      - --response-origin-only-with-rfc5780
+      - --channel-lifetime=600
+      - --permission-lifetime=300
+      - --max-bps=256000
+    network_mode: host
 
 networks:
-  traefik-public:
+  traefik:
     external: true
-    name: ${TRAEFIK_NETWORK:-traefik-public}
+    name: ${TRAEFIK_NETWORK:-traefik}

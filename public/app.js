@@ -113,6 +113,47 @@ const AUDIO_PROFILES = {
   }
 };
 
+// Buffered client→server log forwarder so both peers' logs land in the
+// server's docker logs in real time. Avoids the manual copy/paste loop.
+const REMOTE_LOG_BATCH_MS = 500;
+const REMOTE_LOG_MAX_BATCH = 32;
+const remoteLogBuffer = [];
+let remoteLogTimer = null;
+
+function flushRemoteLogs() {
+  remoteLogTimer = null;
+  if (remoteLogBuffer.length === 0) {
+    return;
+  }
+  const batch = remoteLogBuffer.splice(0, remoteLogBuffer.length);
+  try {
+    fetch("/api/debug/log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      keepalive: true,
+      body: JSON.stringify({
+        peer: state.participantId || "",
+        room: state.roomId || "",
+        ua: navigator.userAgent || "",
+        entries: batch
+      })
+    }).catch(() => {});
+  } catch {
+    // ignore — best-effort
+  }
+}
+
+function scheduleRemoteLogFlush() {
+  if (remoteLogTimer) {
+    return;
+  }
+  if (remoteLogBuffer.length >= REMOTE_LOG_MAX_BATCH) {
+    flushRemoteLogs();
+    return;
+  }
+  remoteLogTimer = setTimeout(flushRemoteLogs, REMOTE_LOG_BATCH_MS);
+}
+
 function log(message, extra = null) {
   const timestamp = new Date().toLocaleTimeString();
   const line = extra
@@ -121,6 +162,8 @@ function log(message, extra = null) {
   if (logOutput) {
     logOutput.textContent = `${line}\n${logOutput.textContent}`.trim();
   }
+  remoteLogBuffer.push({ message, context: extra });
+  scheduleRemoteLogFlush();
 }
 
 function updateStatus(text) {
@@ -172,7 +215,23 @@ function updateControls() {
 }
 
 async function unlockSpeaker() {
+  // Always try to resume the codec2 AudioContext on a user gesture — under
+  // codec2 relay transport, audio playback goes through the AudioContext,
+  // not through the remoteAudio element, so it must be resumed explicitly.
+  if (codec2.audioContext && codec2.audioContext.state === "suspended") {
+    try {
+      await codec2.audioContext.resume();
+      log("Codec2 AudioContext resumed");
+    } catch (error) {
+      log("Codec2 AudioContext resume failed", { message: error.message });
+    }
+  }
+
   if (!remoteAudio) {
+    state.speakerUnlocked = Boolean(
+      codec2.audioContext && codec2.audioContext.state === "running"
+    );
+    updateControls();
     return;
   }
 
@@ -181,7 +240,11 @@ async function unlockSpeaker() {
     remoteAudio.src;
 
   if (!hasPlayableMedia) {
-    state.speakerUnlocked = false;
+    // No WebRTC remote stream yet, but if codec2 AudioContext is running we
+    // can still consider the speaker unlocked for the relay path.
+    state.speakerUnlocked = Boolean(
+      codec2.audioContext && codec2.audioContext.state === "running"
+    );
     updateControls();
     return;
   }
@@ -398,12 +461,17 @@ async function ensureLocalAudio() {
   await refreshMicPermissionState();
 
   try {
+    // Do NOT force sampleRate/channelCount/sampleSize constraints, and
+    // **disable echoCancellation**. Safari (macOS + iOS) detects any path
+    // from a getUserMedia source node to audioContext.destination as a
+    // loopback and feeds the mic input buffers full of zeros (peakAbs=0)
+    // even when the path goes through a gain=0 node. The codec2 graph
+    // unavoidably needs the encoder output to reach destination so iOS
+    // schedules the worklet's process() callback at all. With AEC enabled
+    // those two requirements conflict and the mic ends up silent.
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        channelCount: 1,
-        sampleRate: 16000,
-        sampleSize: 16,
-        echoCancellation: true,
+        echoCancellation: false,
         noiseSuppression: true,
         autoGainControl: true
       },
@@ -479,7 +547,9 @@ function closeSignalingSocket() {
 }
 
 function closePeerConnection() {
-  codec2.teardown();
+  // Keep the prewarmed AudioContext alive across reconnects so we don't lose
+  // the original join-button user gesture that allowed it to start.
+  codec2.teardown({ closeAudioContext: false });
   if (state.peerConnection) {
     state.peerConnection.onicecandidate = null;
     state.peerConnection.ondatachannel = null;
@@ -593,6 +663,13 @@ function updateAudioSectionAttribute(section, attribute, value) {
     return section.replace(regex, `a=${attribute}:${value}`);
   }
 
+  // Insert before any trailing newline(s) so we don't create a blank line
+  // in the SDP body when the audio section is the last m-section
+  // (which happens under codec2 relay transport: no data-channel section is added).
+  const trailing = section.match(/(\r?\n)+$/);
+  if (trailing) {
+    return `${section.slice(0, -trailing[0].length)}\r\na=${attribute}:${value}${trailing[0]}`;
+  }
   return `${section}\r\na=${attribute}:${value}`;
 }
 
@@ -752,8 +829,10 @@ function pickAudioProfile({
 
 async function adaptAudioCompression(metrics) {
   const nextProfile = pickAudioProfile(metrics);
+  // Under relay transport, codec2/FARGAN is always desired regardless of profile.
+  const desiredCodec2 = codec2.useRelayTransport() || nextProfile === "extreme";
   if (nextProfile === state.audioProfile) {
-    await codec2.setDesiredActive(nextProfile === "extreme");
+    await codec2.setDesiredActive(desiredCodec2);
     return;
   }
 
@@ -770,7 +849,7 @@ async function adaptAudioCompression(metrics) {
   });
 
   await applySenderParameters();
-  await codec2.setDesiredActive(nextProfile === "extreme");
+  await codec2.setDesiredActive(desiredCodec2);
 }
 
 async function createPeerConnection() {
@@ -1303,6 +1382,14 @@ async function joinRoom(event) {
     return;
   }
 
+  // Synchronously create + resume the codec2 AudioContext while the join-button
+  // user gesture is still active. If we wait until codec2.init runs (after
+  // getUserMedia + several awaits), the gesture is consumed and Chrome's
+  // autoplay policy leaves the context suspended forever — encoder/decoder
+  // worklets never run and audio never flows. This must happen before the
+  // first await in this function.
+  codec2.prewarmAudioContext();
+
   try {
     setMicStatus(
       "pending",
@@ -1347,7 +1434,14 @@ async function joinRoom(event) {
   } catch (error) {
     log("Join failed", { message: error.message });
     updateStatus("Join failed");
-    alert(`Join failed: ${error.message}`);
+    const isMicError = error.name === "NotAllowedError" || error.name === "NotFoundError" ||
+      error.name === "NotReadableError" || error.name === "OverconstrainedError" ||
+      error.name === "TypeError" || (error.message && error.message.includes("microphone"));
+    if (isMicError) {
+      alert("Microphone access is required to join.\n\nPlease allow microphone access in your browser settings and try again.\n\nIf you opened this link from Telegram, WhatsApp, or another app, tap the menu and choose \"Open in Safari\" or \"Open in Chrome\" instead.");
+    } else {
+      alert(`Join failed: ${error.message}`);
+    }
   }
 }
 
@@ -1422,10 +1516,38 @@ window.addEventListener("beforeunload", () => {
   }
 });
 
-resetRemoteAudio();
-refreshMicPermissionState().catch((error) => {
-  log("Initial microphone permission check failed", { message: error.message });
+// Aggressive AudioContext rescuer: on ANY user interaction, try to resume any
+// suspended codec2 AudioContext. This is the safety net for the case where the
+// first-joining peer's user-gesture window has long expired by the time the
+// peer-joined event arrives and codec2.init runs.
+function rescueAudioContext() {
+  const ctx = codec2.audioContext;
+  if (!ctx) {
+    return;
+  }
+  if (ctx.state === "suspended") {
+    ctx.resume().then(() => {
+      log("Codec2 AudioContext resumed via gesture rescue", { state: ctx.state });
+    }).catch((error) => {
+      log("Codec2 AudioContext rescue failed", { message: error.message });
+    });
+  }
+}
+["click", "touchstart", "keydown", "pointerdown"].forEach((eventName) => {
+  window.addEventListener(eventName, rescueAudioContext, { capture: true, passive: true });
 });
+
+resetRemoteAudio();
+(async () => {
+  const permState = await refreshMicPermissionState().catch(() => "unknown");
+  if (permState === "prompt" || permState === "unknown") {
+    try {
+      await ensureLocalAudio();
+    } catch (error) {
+      log("Early microphone request failed", { message: error.message });
+    }
+  }
+})();
 updateControls();
 log("Ready");
 
@@ -1865,6 +1987,11 @@ const codec2 = {
       return;
     }
 
+    if (data.type === "log") {
+      log(`Codec2 ${kind} worker`, data);
+      return;
+    }
+
     if (data.type === "ready") {
       this.samplesPerFrame = data.samplesPerFrame || this.samplesPerFrame;
       this.bytesPerFrame = data.bytesPerFrame || this.bytesPerFrame;
@@ -1892,7 +2019,8 @@ const codec2 = {
     }
 
     if (kind === "encoder" && data.type === "encoded") {
-      if (this.active && this.dataChannel?.readyState === "open") {
+      // sendEncodedFrame already picks the right transport (relay socket vs data channel).
+      if (this.active) {
         this.sendEncodedFrame(data.data, data.features || {});
       }
     }
@@ -2025,8 +2153,44 @@ const codec2 = {
     await this.syncActiveState();
   },
 
+  // Synchronously create the AudioContext during a user gesture (e.g., the
+  // Join button click) so the browser autoplay policy doesn't leave it
+  // suspended once we get to codec2.init() many awaits later. The actual
+  // wasm/worklet loading happens later in init().
+  prewarmAudioContext() {
+    if (!this.isSupported()) {
+      return null;
+    }
+    if (this.audioContext) {
+      // Already exists; just try to resume it (still cheap during a gesture).
+      this.audioContext.resume().catch(() => {});
+      return this.audioContext;
+    }
+    try {
+      // Do NOT force sampleRate: Safari (especially iOS) can't always honor
+      // 48000 and silently outputs nothing if the device's native rate
+      // differs. The codec2 worklet already handles resampling between the
+      // context rate and codec2's 8 kHz internal rate.
+      const audioCtx = new AudioContext();
+      // Synchronous resume call; under a fresh user gesture this transitions
+      // immediately to "running" in Chrome/Safari/Firefox.
+      audioCtx.resume().catch(() => {});
+      this.audioContext = audioCtx;
+      log("Codec2 AudioContext prewarmed", {
+        state: audioCtx.state,
+        sampleRate: audioCtx.sampleRate
+      });
+      return audioCtx;
+    } catch (error) {
+      log("Codec2 AudioContext prewarm failed", { message: error.message });
+      return null;
+    }
+  },
+
   async init(peerConnection, localStream, { initiator = false } = {}) {
-    this.teardown();
+    // Preserve the prewarmed AudioContext across teardown so we don't lose
+    // the user-gesture origin that allowed it to start.
+    this.teardown({ closeAudioContext: false });
     if (!this.isSupported()) {
       return;
     }
@@ -2037,30 +2201,116 @@ const codec2 = {
         log("Codec2 WASM not found, skipping ultra-low-bitrate mode");
         return;
       }
-      const wasmModule = await WebAssembly.compile(await wasmResponse.arrayBuffer());
+      // Keep the raw bytes as the canonical payload — structured-cloning a
+      // WebAssembly.Module into AudioWorkletGlobalScope is unreliable on Safari
+      // iOS (the worklet receives undefined and silently no-ops). The worker
+      // accepts either a Module or an ArrayBuffer; we send bytes for safety.
+      const wasmBytes = await wasmResponse.arrayBuffer();
 
-      const audioCtx = new AudioContext({ sampleRate: 48000 });
+      const audioCtx = (this.audioContext && this.audioContext.state !== "closed")
+        ? this.audioContext
+        : new AudioContext();
       await audioCtx.resume().catch(() => {});
+      log("Codec2 AudioContext state at init", {
+        state: audioCtx.state,
+        sampleRate: audioCtx.sampleRate
+      });
       await audioCtx.audioWorklet.addModule("/codec2-worker.js");
 
-      // Encoder: local mic → Codec2 → DataChannel
-      const encoderNode = new AudioWorkletNode(audioCtx, "codec2-encoder");
+      // iOS Safari quirk: createMediaStreamSource() yields a node that
+      // delivers no audio unless the same MediaStream is also being consumed
+      // by an HTMLMediaElement that has had .play() called on it. Attach the
+      // local stream to a hidden, muted <audio> element and start it before
+      // wiring up the WebAudio graph. This is a no-op on Chrome/Firefox.
+      try {
+        if (this.iosKeepalivePlayer) {
+          this.iosKeepalivePlayer.pause();
+          this.iosKeepalivePlayer.srcObject = null;
+          this.iosKeepalivePlayer.remove();
+        }
+        const keepalive = document.createElement("audio");
+        keepalive.muted = true;
+        keepalive.setAttribute("playsinline", "");
+        keepalive.setAttribute("autoplay", "");
+        keepalive.style.display = "none";
+        keepalive.srcObject = localStream;
+        document.body.appendChild(keepalive);
+        // play() may reject without a fresh user gesture; that's OK on
+        // browsers that don't need this trick — the catch swallows it.
+        keepalive.play().catch((error) => {
+          log("iOS keepalive audio element play deferred", { message: error.message });
+        });
+        this.iosKeepalivePlayer = keepalive;
+        log("iOS keepalive audio element attached");
+      } catch (error) {
+        log("iOS keepalive audio element setup failed", { message: error.message });
+      }
+
+      // Encoder: local mic → Codec2 → relay
+      // Pass explicit channel options — iOS Safari is buggy with implicit
+      // defaults and may end up with zero-length input/output buses.
+      const encoderNode = new AudioWorkletNode(audioCtx, "codec2-encoder", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+        channelCount: 1,
+        channelCountMode: "explicit",
+        channelInterpretation: "speakers"
+      });
       const source = audioCtx.createMediaStreamSource(localStream);
       source.connect(encoderNode);
-      encoderNode.port.onmessage = (e) => this.handleWorkerMessage("encoder", e.data);
-      encoderNode.port.postMessage({ type: "init", module: wasmModule });
 
-      // Decoder: DataChannel → Codec2 → speaker
-      const decoderNode = new AudioWorkletNode(audioCtx, "codec2-decoder");
+      // Keep the encoder reachable from destination so Safari schedules
+      // process() on the worklet, but DO NOT route the mic source itself
+      // to destination — that creates an AEC-detected loopback that makes
+      // Safari deliver all-zero buffers to the mic node (peakAbs=0).
+      // The encoder's outputs are silence (it writes zeros every tick), so
+      // routing through this gain=0 path is purely a "node liveness" hint.
+      const encoderSilencer = audioCtx.createGain();
+      encoderSilencer.gain.value = 0;
+      encoderNode.connect(encoderSilencer);
+      encoderSilencer.connect(audioCtx.destination);
+      encoderNode.port.onmessage = (e) => this.handleWorkerMessage("encoder", e.data);
+      // Send a fresh slice each time so neither worker can transfer-detach
+      // the other's buffer.
+      encoderNode.port.postMessage({ type: "init", bytes: wasmBytes.slice(0) });
+
+      // Decoder: relay → Codec2 → speaker
+      const decoderNode = new AudioWorkletNode(audioCtx, "codec2-decoder", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+        channelCount: 1,
+        channelCountMode: "explicit",
+        channelInterpretation: "speakers"
+      });
       decoderNode.connect(audioCtx.destination);
       decoderNode.port.onmessage = (e) => this.handleWorkerMessage("decoder", e.data);
-      decoderNode.port.postMessage({ type: "init", module: wasmModule });
+      decoderNode.port.postMessage({ type: "init", bytes: wasmBytes.slice(0) });
+
+      // iOS Safari "audio render thread won't start" workaround: briefly
+      // start and stop a silent oscillator. This forces the audio context's
+      // render quantum loop to actually start, which then begins scheduling
+      // process() on the worklet nodes. No-op on Chrome/Firefox.
+      try {
+        const kicker = audioCtx.createOscillator();
+        const kickerGain = audioCtx.createGain();
+        kickerGain.gain.value = 0;
+        kicker.connect(kickerGain).connect(audioCtx.destination);
+        kicker.start();
+        kicker.stop(audioCtx.currentTime + 0.05);
+        log("iOS audio render thread kicker started");
+      } catch (error) {
+        log("iOS audio render kicker skipped", { message: error.message });
+      }
 
       this.sender = peerConnection
         .getSenders()
         .find((item) => item.track && item.track.kind === "audio") || null;
       this.originalTrack = localStream.getAudioTracks()[0] || null;
-      this.desiredActive = state.audioProfile === "extreme";
+      // Under relay transport (codec2 + FARGAN), force codec2 always-on instead of
+      // only activating it under the "extreme" network profile.
+      this.desiredActive = this.useRelayTransport() || state.audioProfile === "extreme";
 
       if (this.useRelayTransport()) {
         await this.connectRelaySocket();
@@ -2092,7 +2342,7 @@ const codec2 = {
     }
   },
 
-  teardown() {
+  teardown({ closeAudioContext = true } = {}) {
     this.desiredActive = false;
     if (this.sender && this.originalTrack && this.active) {
       this.sender.replaceTrack(this.originalTrack).catch(() => {});
@@ -2112,7 +2362,7 @@ const codec2 = {
       clearInterval(this.playoutIntervalId);
       this.playoutIntervalId = null;
     }
-    if (this.audioContext) {
+    if (this.audioContext && closeAudioContext) {
       this.audioContext.close().catch(() => {});
     }
     if (this.dataChannel) {
@@ -2123,10 +2373,22 @@ const codec2 = {
       this.dataChannel.close();
     }
     this.closeRelaySocket();
+    if (this.iosKeepalivePlayer) {
+      try {
+        this.iosKeepalivePlayer.pause();
+        this.iosKeepalivePlayer.srcObject = null;
+        this.iosKeepalivePlayer.remove();
+      } catch (error) {
+        // best-effort cleanup
+      }
+      this.iosKeepalivePlayer = null;
+    }
     this.encoderNode = null;
     this.decoderNode = null;
     this.dataChannel = null;
-    this.audioContext = null;
+    if (closeAudioContext) {
+      this.audioContext = null;
+    }
     this.sender = null;
     this.originalTrack = null;
     this.packetizer = null;
