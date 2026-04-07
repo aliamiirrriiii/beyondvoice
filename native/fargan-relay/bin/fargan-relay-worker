@@ -1,11 +1,16 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 NATIVE_BIN="$SCRIPT_DIR/fargan-relay-worker-native"
 STDIO_WORKER="$SCRIPT_DIR/../stdio-worker.js"
 
-if [[ -x "$NATIVE_BIN" ]]; then
+if [ "${NEURAL_RELAY_REQUIRE_NATIVE:-0}" = "1" ] && [ ! -x "$NATIVE_BIN" ]; then
+  echo "native relay binary is required but missing: $NATIVE_BIN" >&2
+  exit 1
+fi
+
+if [ -x "$NATIVE_BIN" ]; then
   exec "$NATIVE_BIN"
 fi
 

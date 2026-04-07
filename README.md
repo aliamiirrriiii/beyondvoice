@@ -163,6 +163,7 @@ Application runtime:
 - `TURN_USERNAME`
 - `TURN_CREDENTIAL`
 - `ALLOWED_ORIGIN`
+- `ENABLE_MEDIA_RELAY`
 - `NEURAL_RELAY_MODE`
 - `NEURAL_RELAY_BACKEND`
 
@@ -244,7 +245,7 @@ This keeps the heaviest transport repair logic off the recipient device without 
 
 ## Neural relay modes
 
-The relay now exposes a pluggable neural-processing stage behind a stable interface:
+The relay now exposes a pluggable neural-processing stage behind a stable interface. It is opt-in: set `ENABLE_MEDIA_RELAY=true` when you explicitly want the Codec2 relay transport.
 
 - `NEURAL_RELAY_MODE=off`
   Plain relay pass-through. Jitter buffering and transport repair stay enabled.
@@ -252,6 +253,8 @@ The relay now exposes a pluggable neural-processing stage behind a stable interf
   Relay-side concealment shaping path intended for a future Opus Deep PLC bridge.
 - `NEURAL_RELAY_MODE=fargan`
   Relay-side native FARGAN synthesis path. The relay decodes incoming Codec2 700C packets, computes LPCNet features from the decoded speech, synthesizes PCM with FARGAN, and uses LPCNet PLC for concealed frames before sending PCM payloads back to the browser.
+
+`fargan` requires the native relay executable. If that executable is unavailable, the server degrades to `deep-plc` instead of running the JS scaffold and misreporting it as real FARGAN. The Docker image now builds a Linux-native relay binary during `docker build`, so container deployments do not depend on a host-built macOS binary.
 
 Backends:
 

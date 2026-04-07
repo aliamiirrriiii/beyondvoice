@@ -33,6 +33,7 @@ const TURN_USERNAME = process.env.TURN_USERNAME || "";
 const TURN_CREDENTIAL = process.env.TURN_CREDENTIAL || "";
 const AUTH_USERNAME = process.env.AUTH_USERNAME || "";
 const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "";
+const ENABLE_MEDIA_RELAY = /^(1|true|yes|on)$/i.test(String(process.env.ENABLE_MEDIA_RELAY || ""));
 const NEURAL_RELAY_MODE = String(process.env.NEURAL_RELAY_MODE || "off").trim().toLowerCase();
 const NEURAL_RELAY_BACKEND = String(process.env.NEURAL_RELAY_BACKEND || "in-process")
   .trim()
@@ -342,7 +343,11 @@ function buildIceServersForParticipant(participantId) {
   });
 }
 
-function appConfigScript({ neuralRelayMode = "off", neuralRelayBackend = "disabled" } = {}) {
+function appConfigScript({
+  neuralRelayMode = "off",
+  neuralRelayBackend = "disabled",
+  neuralRelayRuntime = "disabled"
+} = {}) {
   const codec2Available =
     fs.existsSync(path.join(PUBLIC_DIR, "codec2.wasm")) &&
     fs.existsSync(path.join(PUBLIC_DIR, "codec2-worker.js"));
@@ -355,9 +360,10 @@ function appConfigScript({ neuralRelayMode = "off", neuralRelayBackend = "disabl
     wsPath: "/ws",
     mediaWsPath: "/media",
     enableCodec2: codec2Available,
-    enableMediaRelay: codec2Available,
+    enableMediaRelay: codec2Available && ENABLE_MEDIA_RELAY,
     neuralRelayMode: codec2Available ? neuralRelayMode : "off",
-    neuralRelayBackend: codec2Available ? neuralRelayBackend : "disabled"
+    neuralRelayBackend: codec2Available ? neuralRelayBackend : "disabled",
+    neuralRelayRuntime: codec2Available ? neuralRelayRuntime : "disabled"
   };
 
   return `window.APP_CONFIG = ${JSON.stringify(config, null, 2)};`;
@@ -942,9 +948,10 @@ async function main() {
     mode: NEURAL_RELAY_MODE,
     backend: NEURAL_RELAY_BACKEND
   });
-  const cachedAppConfig = appConfigScript({
+  const getAppConfigScript = () => appConfigScript({
     neuralRelayMode: neuralRelay.mode,
-    neuralRelayBackend: neuralRelay.backend
+    neuralRelayBackend: neuralRelay.backend,
+    neuralRelayRuntime: neuralRelay.runtime
   });
   const deliverFrameCounters = new Map();
   const mediaRelay = new MediaRelayController({
@@ -1045,7 +1052,8 @@ async function main() {
             rooms: roomsCount,
             signaling: store.mode,
             neuralRelayMode: neuralRelay.mode,
-            neuralRelayBackend: neuralRelay.backend
+            neuralRelayBackend: neuralRelay.backend,
+            neuralRelayRuntime: neuralRelay.runtime
           });
         })
         .catch((error) => {
@@ -1060,7 +1068,8 @@ async function main() {
         shuttingDown: isShuttingDown,
         signaling: store.mode,
         neuralRelayMode: neuralRelay.mode,
-        neuralRelayBackend: neuralRelay.backend
+        neuralRelayBackend: neuralRelay.backend,
+        neuralRelayRuntime: neuralRelay.runtime
       });
       return true;
     }
@@ -1164,7 +1173,7 @@ async function main() {
     }
 
     if (url.pathname === "/app-config.js") {
-      text(response, 200, cachedAppConfig, "application/javascript; charset=utf-8");
+      text(response, 200, getAppConfigScript(), "application/javascript; charset=utf-8");
       return;
     }
 

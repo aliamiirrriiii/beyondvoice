@@ -1,5 +1,5 @@
 const assert = require("assert");
-const { createNeuralRelay } = require("../neural-relay.js");
+const { createNeuralRelay, resolveRelayModeAndBackend } = require("../neural-relay.js");
 
 function makeFrame({ concealed = false } = {}) {
   return {
@@ -36,17 +36,17 @@ async function testInProcessRelayPassThrough() {
   await relay.close();
 }
 
-async function testChildProcessRelayScaffoldMode() {
-  const relay = createNeuralRelay({ mode: "fargan", backend: "child-process" });
+async function testChildProcessDeepPlcMode() {
+  const relay = createNeuralRelay({ mode: "deep-plc", backend: "child-process" });
   const result = await relay.processFrame({
     roomId: "room",
     senderId: "sender",
     frame: makeFrame({ concealed: true })
   });
 
-  assert.equal(result.metadata.mode, "fargan");
+  assert.equal(result.metadata.mode, "deep-plc");
   assert.equal(result.metadata.enhanced, true);
-  assert.equal(result.metadata.strategy, "fargan-worker-scaffold");
+  assert.equal(result.metadata.strategy, "concealment-shaped-features");
   assert.deepEqual(Array.from(result.frame.packet.payload), [1, 2, 3, 4]);
   await relay.close();
 }
@@ -75,6 +75,14 @@ async function testNativeExecutableRelayScaffoldMode() {
 }
 
 async function testMissingNativeExecutableFallsBack() {
+  const resolved = resolveRelayModeAndBackend({
+    mode: "fargan",
+    backend: "native-exec",
+    executablePath: "/definitely/missing/fargan-relay-worker"
+  });
+  assert.equal(resolved.mode, "deep-plc");
+  assert.equal(resolved.backend, "in-process");
+
   const relay = createNeuralRelay({
     mode: "fargan",
     backend: "native-exec",
@@ -85,17 +93,40 @@ async function testMissingNativeExecutableFallsBack() {
   const result = await relay.processFrame({
     roomId: "room",
     senderId: "sender",
-    frame: makeFrame()
+    frame: makeFrame({ concealed: true })
   });
-  assert.equal(result.metadata.mode, "fargan");
+  assert.equal(result.metadata.mode, "deep-plc");
+  assert.equal(result.metadata.strategy, "concealment-shaped-features");
   await relay.close();
+}
+
+function testWrapperRequiresRealNativeBinary() {
+  const resolved = resolveRelayModeAndBackend({
+    mode: "fargan",
+    backend: "native-exec",
+    executablePath: "/definitely/missing/fargan-relay-worker"
+  });
+
+  assert.equal(resolved.mode, "deep-plc");
+}
+
+function testFarganAutoPromotesToNativeExecWhenAvailable() {
+  const resolved = resolveRelayModeAndBackend({
+    mode: "fargan",
+    backend: "in-process"
+  });
+
+  assert.equal(resolved.mode, "fargan");
+  assert.equal(resolved.backend, "native-exec");
 }
 
 async function run() {
   await testInProcessRelayPassThrough();
-  await testChildProcessRelayScaffoldMode();
+  await testChildProcessDeepPlcMode();
   await testNativeExecutableRelayScaffoldMode();
   await testMissingNativeExecutableFallsBack();
+  testWrapperRequiresRealNativeBinary();
+  testFarganAutoPromotesToNativeExecWhenAvailable();
   console.log("neural-relay tests passed");
 }
 

@@ -72,7 +72,7 @@ const state = {
   micPermissionState: "unknown",
   micPermissionStatus: null,
   speakerUnlocked: false,
-  audioProfile: "ultra"
+  audioProfile: "lean"
 };
 
 const DEFAULT_ICE_SERVERS = window.APP_CONFIG?.iceServers || [
@@ -85,31 +85,31 @@ let lastProfileSwitchAt = 0;
 const AUDIO_PROFILES = {
   lean: {
     label: "Lean",
-    maxBitrate: 9000,
-    maxAverageBitrate: 9000,
-    maxPlaybackRate: 12000,
-    ptime: 40
+    maxBitrate: 32000,
+    maxAverageBitrate: 32000,
+    maxPlaybackRate: 24000,
+    ptime: 20
   },
   tight: {
     label: "Tight",
-    maxBitrate: 7000,
-    maxAverageBitrate: 7000,
-    maxPlaybackRate: 8000,
-    ptime: 60
+    maxBitrate: 24000,
+    maxAverageBitrate: 24000,
+    maxPlaybackRate: 16000,
+    ptime: 20
   },
   ultra: {
     label: "Ultra",
-    maxBitrate: 6000,
-    maxAverageBitrate: 6000,
-    maxPlaybackRate: 8000,
-    ptime: 60
+    maxBitrate: 16000,
+    maxAverageBitrate: 16000,
+    maxPlaybackRate: 12000,
+    ptime: 40
   },
   extreme: {
     label: "Extreme",
-    maxBitrate: 4000,
-    maxAverageBitrate: 4000,
+    maxBitrate: 9000,
+    maxAverageBitrate: 9000,
     maxPlaybackRate: 8000,
-    ptime: 120
+    ptime: 60
   }
 };
 
@@ -664,7 +664,7 @@ function resetCallState({ preserveLog = true } = {}) {
   state.iceServers = null;
   state.muted = false;
   state.speakerUnlocked = false;
-  state.audioProfile = "ultra";
+  state.audioProfile = "lean";
 
   if (state.pollAbortController) {
     state.pollAbortController.abort();
@@ -825,29 +825,40 @@ function pickAudioProfile({
     rttMs == null &&
     availableOutgoingBitrateKbps == null
   ) {
-    return "ultra";
+    return "lean";
   }
 
   if (
-    (typeof packetsLost === "number" && packetsLost > 8) ||
-    (typeof jitterMs === "number" && jitterMs >= 60) ||
-    (typeof rttMs === "number" && rttMs >= 400) ||
+    (typeof packetsLost === "number" && packetsLost > 12) ||
+    (typeof jitterMs === "number" && jitterMs >= 120) ||
+    (typeof rttMs === "number" && rttMs >= 700) ||
     (typeof availableOutgoingBitrateKbps === "number" &&
       availableOutgoingBitrateKbps > 0 &&
-      availableOutgoingBitrateKbps <= 8)
+      availableOutgoingBitrateKbps <= 10)
   ) {
     return "extreme";
   }
 
   if (
-    (typeof packetsLost === "number" && packetsLost > 3) ||
+    (typeof packetsLost === "number" && packetsLost > 6) ||
+    (typeof jitterMs === "number" && jitterMs >= 60) ||
+    (typeof rttMs === "number" && rttMs >= 400) ||
+    (typeof availableOutgoingBitrateKbps === "number" &&
+      availableOutgoingBitrateKbps > 0 &&
+      availableOutgoingBitrateKbps <= 14)
+  ) {
+    return "ultra";
+  }
+
+  if (
+    (typeof packetsLost === "number" && packetsLost > 2) ||
     (typeof jitterMs === "number" && jitterMs >= 30) ||
     (typeof rttMs === "number" && rttMs >= 250) ||
     (typeof availableOutgoingBitrateKbps === "number" &&
       availableOutgoingBitrateKbps > 0 &&
-      availableOutgoingBitrateKbps <= 12)
+      availableOutgoingBitrateKbps <= 24)
   ) {
-    return "ultra";
+    return "tight";
   }
 
   if (
@@ -855,7 +866,7 @@ function pickAudioProfile({
     (typeof jitterMs !== "number" || jitterMs < 18) &&
     (typeof rttMs !== "number" || rttMs < 160) &&
     (typeof availableOutgoingBitrateKbps === "number" &&
-      availableOutgoingBitrateKbps >= 28)
+      availableOutgoingBitrateKbps >= 32)
   ) {
     return "lean";
   }
@@ -1717,11 +1728,15 @@ const codec2 = {
     if (vocoderText) {
       if (this.useRelayTransport()) {
         const mode = this.getNeuralRelayMode();
-        const backend = String(window.APP_CONFIG?.neuralRelayBackend || "unknown");
+        const runtime = String(
+          window.APP_CONFIG?.neuralRelayRuntime ||
+          window.APP_CONFIG?.neuralRelayBackend ||
+          "unknown"
+        );
         vocoderText.textContent =
           mode === "off"
-            ? `Relay passthrough (${backend})`
-            : `${mode} relay (${backend})`;
+            ? `Relay passthrough (${runtime})`
+            : `${mode} relay (${runtime})`;
       } else {
         vocoderText.textContent = this.neuralVocoder
           ? this.neuralVocoder.describe()

@@ -11,6 +11,25 @@ const DEFAULT_NATIVE_EXECUTABLE = path.join(
   "bin",
   "fargan-relay-worker"
 );
+const DEFAULT_NATIVE_BINARY = path.join(
+  __dirname,
+  "native",
+  "fargan-relay",
+  "bin",
+  "fargan-relay-worker-native"
+);
+
+function hasUsableNativeRelayBinary(executablePath) {
+  const candidate = executablePath || process.env.NEURAL_RELAY_EXECUTABLE || DEFAULT_NATIVE_EXECUTABLE;
+  const baseName = path.basename(candidate);
+  if (baseName === "fargan-relay-worker") {
+    return fs.existsSync(path.join(path.dirname(candidate), "fargan-relay-worker-native"));
+  }
+  if (candidate === DEFAULT_NATIVE_EXECUTABLE) {
+    return fs.existsSync(DEFAULT_NATIVE_BINARY);
+  }
+  return fs.existsSync(candidate);
+}
 
 function serializeFrame(frame) {
   if (!frame || frame.kind !== "packet" || !frame.packet) {
@@ -163,7 +182,8 @@ class NativeExecutableNeuralRelay {
     this.process = spawn(this.executablePath, [], {
       env: {
         ...process.env,
-        NEURAL_RELAY_MODE: this.mode
+        NEURAL_RELAY_MODE: this.mode,
+        NEURAL_RELAY_REQUIRE_NATIVE: this.mode === "fargan" ? "1" : "0"
       },
       stdio: ["pipe", "pipe", "pipe"]
     });
@@ -260,29 +280,63 @@ class NativeExecutableNeuralRelay {
   }
 }
 
-function createNeuralRelay({
+function resolveRelayModeAndBackend({
   mode = "off",
   backend = "in-process",
   executablePath
 } = {}) {
   const normalizedMode = normalizeMode(mode);
+  const normalizedBackend = String(backend || "in-process").trim().toLowerCase();
+  const resolvedExecutablePath =
+    executablePath || process.env.NEURAL_RELAY_EXECUTABLE || DEFAULT_NATIVE_EXECUTABLE;
+  const nativeExecutableAvailable = hasUsableNativeRelayBinary(resolvedExecutablePath);
+
+  if (normalizedMode !== "fargan") {
+    return {
+      mode: normalizedMode,
+      backend: normalizedBackend,
+      executablePath: resolvedExecutablePath
+    };
+  }
+
+  if (nativeExecutableAvailable) {
+    return {
+      mode: "fargan",
+      backend: "native-exec",
+      executablePath: resolvedExecutablePath
+    };
+  }
+
+  return {
+    mode: "deep-plc",
+    backend: normalizedBackend === "child-process" ? "child-process" : "in-process",
+    executablePath: resolvedExecutablePath
+  };
+}
+
+function createNeuralRelay({
+  mode = "off",
+  backend = "in-process",
+  executablePath
+} = {}) {
+  const resolved = resolveRelayModeAndBackend({ mode, backend, executablePath });
+  const normalizedMode = resolved.mode;
+  const normalizedBackend = resolved.backend;
   if (normalizedMode === "off") {
     return new InProcessNeuralRelay({ mode: normalizedMode });
   }
 
-  if (backend === "native-exec") {
-    const resolvedExecutablePath =
-      executablePath || process.env.NEURAL_RELAY_EXECUTABLE || DEFAULT_NATIVE_EXECUTABLE;
-    if (!fs.existsSync(resolvedExecutablePath)) {
+  if (normalizedBackend === "native-exec") {
+    if (!fs.existsSync(resolved.executablePath)) {
       return new InProcessNeuralRelay({ mode: normalizedMode });
     }
     return new NativeExecutableNeuralRelay({
       mode: normalizedMode,
-      executablePath: resolvedExecutablePath
+      executablePath: resolved.executablePath
     });
   }
 
-  if (backend === "child-process") {
+  if (normalizedBackend === "child-process") {
     return new ChildProcessNeuralRelay({ mode: normalizedMode });
   }
 
@@ -293,5 +347,6 @@ module.exports = {
   ChildProcessNeuralRelay,
   InProcessNeuralRelay,
   NativeExecutableNeuralRelay,
-  createNeuralRelay
+  createNeuralRelay,
+  resolveRelayModeAndBackend
 };
