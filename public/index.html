@@ -33,6 +33,16 @@
           <input id="name-input" name="name" type="text" placeholder="Your name" autocomplete="nickname" maxlength="32" required />
         </label>
 
+        <label class="field">
+          <span>Opus Mode</span>
+          <select id="opus-mode-select" name="opus-mode">
+            <option value="saver">Data Saver</option>
+            <option value="balanced">Balanced</option>
+            <option value="quality">High Quality</option>
+          </select>
+          <span id="opus-mode-details" class="field-note">Balanced speech quality and bandwidth.</span>
+        </label>
+
         <button id="join-button" type="submit" class="btn btn-join">Join room</button>
       </form>
     </div>

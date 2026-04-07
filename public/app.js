@@ -16,6 +16,8 @@ if ("caches" in window) {
 
 const roomInput = document.querySelector("#room-input");
 const nameInput = document.querySelector("#name-input");
+const opusModeSelect = document.querySelector("#opus-mode-select");
+const opusModeDetails = document.querySelector("#opus-mode-details");
 const joinForm = document.querySelector("#join-form");
 const joinButton = document.querySelector("#join-button");
 const leaveButton = document.querySelector("#leave-button");
@@ -44,6 +46,7 @@ const plcText = document.querySelector("#plc-text");
 const vocoderText = document.querySelector("#vocoder-text");
 const logOutput = document.querySelector("#log-output");
 const ExtremeStack = window.ExtremeStack || null;
+const peerContexts = new Map();
 
 const state = {
   roomId: "",
@@ -57,21 +60,19 @@ const state = {
   muted: false,
   localStream: null,
   remoteStream: null,
-  peerConnection: null,
-  pendingCandidates: [],
   signalingSocket: null,
   signalingConnected: false,
   pollAbortController: null,
   polling: false,
   statsIntervalId: null,
   heartbeatIntervalId: null,
-  reconnectTimerId: null,
   signalingReconnectTimerId: null,
-  lastInboundBytes: 0,
-  lastStatsAt: 0,
+  signalingReconnectAttempts: 0,
+  autoRejoinInFlight: false,
   micPermissionState: "unknown",
   micPermissionStatus: null,
   speakerUnlocked: false,
+  opusMode: "balanced",
   audioProfile: "lean"
 };
 
@@ -82,46 +83,181 @@ const DEFAULT_ICE_SERVERS = window.APP_CONFIG?.iceServers || [
 const PROFILE_SWITCH_COOLDOWN_MS = 5000;
 let lastProfileSwitchAt = 0;
 
-const AUDIO_PROFILES = {
-  lean: {
-    label: "Lean",
-    maxBitrate: 32000,
-    maxAverageBitrate: 32000,
-    maxPlaybackRate: 24000,
-    ptime: 20
+const OPUS_MODE_STORAGE_KEY = "voiceai.opusMode";
+const OPUS_MODES = {
+  saver: {
+    label: "Data Saver",
+    details: "Lowest bandwidth. Best for mobile data and weak connections.",
+    defaultProfile: "tight",
+    profiles: {
+      lean: {
+        label: "Lean",
+        maxBitrate: 24000,
+        maxAverageBitrate: 24000,
+        maxPlaybackRate: 16000,
+        ptime: 20
+      },
+      tight: {
+        label: "Tight",
+        maxBitrate: 18000,
+        maxAverageBitrate: 18000,
+        maxPlaybackRate: 12000,
+        ptime: 20
+      },
+      ultra: {
+        label: "Ultra",
+        maxBitrate: 12000,
+        maxAverageBitrate: 12000,
+        maxPlaybackRate: 12000,
+        ptime: 40
+      },
+      extreme: {
+        label: "Extreme",
+        maxBitrate: 8000,
+        maxAverageBitrate: 8000,
+        maxPlaybackRate: 8000,
+        ptime: 60
+      }
+    }
   },
-  tight: {
-    label: "Tight",
-    maxBitrate: 24000,
-    maxAverageBitrate: 24000,
-    maxPlaybackRate: 16000,
-    ptime: 20
+  balanced: {
+    label: "Balanced",
+    details: "Good speech quality without using too much bandwidth.",
+    defaultProfile: "lean",
+    profiles: {
+      lean: {
+        label: "Lean",
+        maxBitrate: 32000,
+        maxAverageBitrate: 32000,
+        maxPlaybackRate: 24000,
+        ptime: 20
+      },
+      tight: {
+        label: "Tight",
+        maxBitrate: 24000,
+        maxAverageBitrate: 24000,
+        maxPlaybackRate: 16000,
+        ptime: 20
+      },
+      ultra: {
+        label: "Ultra",
+        maxBitrate: 16000,
+        maxAverageBitrate: 16000,
+        maxPlaybackRate: 12000,
+        ptime: 40
+      },
+      extreme: {
+        label: "Extreme",
+        maxBitrate: 9000,
+        maxAverageBitrate: 9000,
+        maxPlaybackRate: 8000,
+        ptime: 60
+      }
+    }
   },
-  ultra: {
-    label: "Ultra",
-    maxBitrate: 16000,
-    maxAverageBitrate: 16000,
-    maxPlaybackRate: 12000,
-    ptime: 40
-  },
-  extreme: {
-    label: "Extreme",
-    maxBitrate: 9000,
-    maxAverageBitrate: 9000,
-    maxPlaybackRate: 8000,
-    ptime: 60
+  quality: {
+    label: "High Quality",
+    details: "Uses more data to keep fuller, cleaner speech on good networks.",
+    defaultProfile: "lean",
+    profiles: {
+      lean: {
+        label: "Lean",
+        maxBitrate: 48000,
+        maxAverageBitrate: 48000,
+        maxPlaybackRate: 32000,
+        ptime: 20
+      },
+      tight: {
+        label: "Tight",
+        maxBitrate: 36000,
+        maxAverageBitrate: 36000,
+        maxPlaybackRate: 24000,
+        ptime: 20
+      },
+      ultra: {
+        label: "Ultra",
+        maxBitrate: 24000,
+        maxAverageBitrate: 24000,
+        maxPlaybackRate: 16000,
+        ptime: 20
+      },
+      extreme: {
+        label: "Extreme",
+        maxBitrate: 12000,
+        maxAverageBitrate: 12000,
+        maxPlaybackRate: 12000,
+        ptime: 40
+      }
+    }
   }
 };
 
+function normalizeOpusMode(mode) {
+  return Object.prototype.hasOwnProperty.call(OPUS_MODES, mode) ? mode : "balanced";
+}
+
+function readStoredOpusMode() {
+  try {
+    return normalizeOpusMode(window.localStorage?.getItem(OPUS_MODE_STORAGE_KEY) || "balanced");
+  } catch {
+    return "balanced";
+  }
+}
+
+function writeStoredOpusMode(mode) {
+  try {
+    window.localStorage?.setItem(OPUS_MODE_STORAGE_KEY, normalizeOpusMode(mode));
+  } catch {
+    // ignore — best-effort
+  }
+}
+
+function getOpusModeConfig(mode = state.opusMode) {
+  return OPUS_MODES[normalizeOpusMode(mode)] || OPUS_MODES.balanced;
+}
+
+function getDefaultAudioProfileForMode(mode = state.opusMode) {
+  return getOpusModeConfig(mode).defaultProfile;
+}
+
+function syncOpusModeUi() {
+  const config = getOpusModeConfig();
+  if (opusModeSelect) {
+    opusModeSelect.value = state.opusMode;
+  }
+  if (opusModeDetails) {
+    opusModeDetails.textContent = config.details;
+  }
+}
+
+function applyOpusMode(mode, { persist = true, resetProfile = true } = {}) {
+  state.opusMode = normalizeOpusMode(mode);
+  if (persist) {
+    writeStoredOpusMode(state.opusMode);
+  }
+  if (resetProfile) {
+    state.audioProfile = getDefaultAudioProfileForMode(state.opusMode);
+  }
+  syncOpusModeUi();
+}
+
 // Buffered client→server log forwarder so both peers' logs land in the
 // server's docker logs in real time. Avoids the manual copy/paste loop.
-const REMOTE_LOG_BATCH_MS = 500;
-const REMOTE_LOG_MAX_BATCH = 32;
+const REMOTE_LOG_BATCH_MS = 2000;
+const REMOTE_LOG_MAX_BATCH = 64;
 const remoteLogBuffer = [];
 let remoteLogTimer = null;
 
+function remoteDebugLogsEnabled() {
+  return Boolean(window.APP_CONFIG?.enableRemoteDebugLogs);
+}
+
 function flushRemoteLogs() {
   remoteLogTimer = null;
+  if (!remoteDebugLogsEnabled()) {
+    remoteLogBuffer.length = 0;
+    return;
+  }
   if (remoteLogBuffer.length === 0) {
     return;
   }
@@ -144,6 +280,10 @@ function flushRemoteLogs() {
 }
 
 function scheduleRemoteLogFlush() {
+  if (!remoteDebugLogsEnabled()) {
+    remoteLogBuffer.length = 0;
+    return;
+  }
   if (remoteLogTimer) {
     return;
   }
@@ -162,8 +302,10 @@ function log(message, extra = null) {
   if (logOutput) {
     logOutput.textContent = `${line}\n${logOutput.textContent}`.trim();
   }
-  remoteLogBuffer.push({ message, context: extra });
-  scheduleRemoteLogFlush();
+  if (remoteDebugLogsEnabled()) {
+    remoteLogBuffer.push({ message, context: extra });
+    scheduleRemoteLogFlush();
+  }
 }
 
 function updateStatus(text) {
@@ -172,7 +314,189 @@ function updateStatus(text) {
   }
 }
 
+function getPeerContexts() {
+  return Array.from(peerContexts.values())
+    .sort((left, right) => left.id.localeCompare(right.id));
+}
+
+function ensurePeerAudioElement(peerId) {
+  const elementId = `remote-audio-${peerId}`;
+  let audio = document.getElementById(elementId);
+  if (audio) {
+    return audio;
+  }
+
+  audio = document.createElement("audio");
+  audio.id = elementId;
+  audio.autoplay = true;
+  audio.setAttribute("playsinline", "");
+  audio.style.display = "none";
+  document.body.appendChild(audio);
+  return audio;
+}
+
+function ensurePeerContext(peerId, displayName = "") {
+  const normalizedPeerId = String(peerId || "").trim();
+  if (!normalizedPeerId || normalizedPeerId === state.participantId) {
+    return null;
+  }
+
+  let context = peerContexts.get(normalizedPeerId);
+  if (!context) {
+    const remoteStream = new MediaStream();
+    const audioElement = ensurePeerAudioElement(normalizedPeerId);
+    audioElement.srcObject = remoteStream;
+    context = {
+      id: normalizedPeerId,
+      displayName: displayName || normalizedPeerId,
+      connection: null,
+      remoteStream,
+      audioElement,
+      pendingCandidates: [],
+      candidateBatch: [],
+      candidateFlushTimerId: null,
+      reconnectTimerId: null,
+      lastInboundBytes: 0,
+      lastStatsAt: 0
+    };
+    peerContexts.set(normalizedPeerId, context);
+  } else if (displayName) {
+    context.displayName = displayName;
+  }
+
+  if (context.audioElement && context.audioElement.srcObject !== context.remoteStream) {
+    context.audioElement.srcObject = context.remoteStream;
+  }
+
+  return context;
+}
+
+function clearPeerTimers(context) {
+  if (!context) {
+    return;
+  }
+  if (context.candidateFlushTimerId) {
+    clearTimeout(context.candidateFlushTimerId);
+    context.candidateFlushTimerId = null;
+  }
+  if (context.reconnectTimerId) {
+    clearTimeout(context.reconnectTimerId);
+    context.reconnectTimerId = null;
+  }
+}
+
+function syncPeerSummary() {
+  const peers = getPeerContexts();
+  if (peers.length === 0) {
+    state.peerId = "";
+    state.peerName = "";
+    return;
+  }
+
+  state.peerId = peers[0].id;
+  if (peers.length === 1) {
+    state.peerName = peers[0].displayName || peers[0].id;
+    return;
+  }
+
+  state.peerName = `${peers.length} participants`;
+}
+
+function getPeerContext(peerId) {
+  return peerContexts.get(String(peerId || "").trim()) || null;
+}
+
+function clearPeerRemoteStream(context) {
+  if (!context?.remoteStream) {
+    return;
+  }
+  for (const track of context.remoteStream.getTracks()) {
+    context.remoteStream.removeTrack(track);
+  }
+}
+
+function getPeerConnections() {
+  return getPeerContexts()
+    .map((context) => context.connection)
+    .filter(Boolean);
+}
+
+function shouldUseCodec2ForCurrentTopology() {
+  return getPeerContexts().length <= 1;
+}
+
+function shouldInitiateOfferForPeer(peerId) {
+  const normalizedPeerId = String(peerId || "").trim();
+  return Boolean(
+    state.joined &&
+      state.participantId &&
+      normalizedPeerId &&
+      state.participantId.localeCompare(normalizedPeerId) < 0
+  );
+}
+
+function updateStatusFromPeerConnections() {
+  const contexts = getPeerContexts();
+  if (!state.joined) {
+    updateStatus("Idle");
+    return;
+  }
+  if (contexts.length === 0) {
+    updateStatus("Waiting for participants");
+    return;
+  }
+
+  const states = contexts.map((context) => context.connection?.connectionState || "new");
+  if (states.every((value) => value === "connected")) {
+    updateStatus("Connected");
+    return;
+  }
+  if (states.some((value) => value === "failed" || value === "disconnected")) {
+    updateStatus("Reconnecting");
+    return;
+  }
+  if (states.some((value) => value === "connecting")) {
+    updateStatus("Connecting");
+    return;
+  }
+  updateStatus("Negotiating");
+}
+
+function destroyPeerContext(peerId) {
+  const context = peerContexts.get(peerId);
+  if (!context) {
+    return;
+  }
+
+  clearPeerTimers(context);
+
+  if (context.connection) {
+    context.connection.onicecandidate = null;
+    context.connection.ontrack = null;
+    context.connection.onconnectionstatechange = null;
+    context.connection.oniceconnectionstatechange = null;
+    context.connection.ondatachannel = null;
+    context.connection.close();
+    context.connection = null;
+  }
+
+  if (context.audioElement) {
+    try {
+      context.audioElement.pause();
+      context.audioElement.srcObject = null;
+      context.audioElement.remove();
+    } catch {
+      // best-effort cleanup
+    }
+  }
+
+  clearPeerRemoteStream(context);
+
+  peerContexts.delete(peerId);
+}
+
 function updatePeerDisplay() {
+  syncPeerSummary();
   if (peerText) {
     peerText.textContent = state.peerName || (state.peerId ? state.peerId : "Waiting");
   }
@@ -196,7 +520,7 @@ function updateControls() {
     muteButton.textContent = state.muted ? "Unmute" : "Mute";
   }
   if (reconnectButton) {
-    reconnectButton.disabled = !state.joined || !state.peerConnection;
+    reconnectButton.disabled = !state.joined || peerContexts.size === 0;
   }
   if (speakerButton) {
     speakerButton.disabled = false;
@@ -227,7 +551,11 @@ async function unlockSpeaker() {
     }
   }
 
-  if (!remoteAudio) {
+  const peerAudioElements = getPeerContexts()
+    .map((context) => context.audioElement)
+    .filter(Boolean);
+
+  if (!remoteAudio && peerAudioElements.length === 0) {
     state.speakerUnlocked = Boolean(
       codec2.audioContext && codec2.audioContext.state === "running"
     );
@@ -235,11 +563,15 @@ async function unlockSpeaker() {
     return;
   }
 
-  const hasPlayableMedia =
-    (remoteAudio.srcObject && remoteAudio.srcObject.getTracks().length > 0) ||
-    remoteAudio.src;
+  const mediaElements = [
+    ...peerAudioElements,
+    ...(remoteAudio ? [remoteAudio] : [])
+  ];
+  const playableElements = mediaElements.filter((element) =>
+    (element.srcObject && element.srcObject.getTracks().length > 0) || element.src
+  );
 
-  if (!hasPlayableMedia) {
+  if (playableElements.length === 0) {
     // No WebRTC remote stream yet, but if codec2 AudioContext is running we
     // can still consider the speaker unlocked for the relay path.
     state.speakerUnlocked = Boolean(
@@ -250,8 +582,8 @@ async function unlockSpeaker() {
   }
 
   try {
-    await remoteAudio.play();
-    state.speakerUnlocked = true;
+    await Promise.all(playableElements.map((element) => element.play().catch(() => null)));
+    state.speakerUnlocked = playableElements.some((element) => !element.paused);
     log("Speaker playback unlocked");
   } catch (error) {
     state.speakerUnlocked = false;
@@ -295,6 +627,10 @@ function buildDeviceSpecificGuidance() {
   }
 
   return "Use a trusted HTTPS page, then allow Microphone when the browser prompt appears. If you denied it earlier, re-enable it in the browser site settings.";
+}
+
+function isSafariFamilyBrowser() {
+  return /^((?!chrome|android).)*safari/i.test(navigator.userAgent || "");
 }
 
 function describeAudioTrack(track) {
@@ -444,15 +780,6 @@ async function refreshMicPermissionState() {
   }
 }
 
-function shouldInitiateOffer() {
-  return Boolean(
-    state.joined &&
-      state.participantId &&
-      state.peerId &&
-      state.participantId.localeCompare(state.peerId) < 0
-  );
-}
-
 async function request(path, options = {}) {
   const response = await fetch(path, {
     headers: {
@@ -484,19 +811,17 @@ async function ensureLocalAudio() {
   await refreshMicPermissionState();
 
   try {
-    // Do NOT force sampleRate/channelCount/sampleSize constraints, and
-    // **disable echoCancellation**. Safari (macOS + iOS) detects any path
-    // from a getUserMedia source node to audioContext.destination as a
-    // loopback and feeds the mic input buffers full of zeros (peakAbs=0)
-    // even when the path goes through a gain=0 node. The codec2 graph
-    // unavoidably needs the encoder output to reach destination so iOS
-    // schedules the worklet's process() callback at all. With AEC enabled
-    // those two requirements conflict and the mic ends up silent.
+    // Do NOT force sampleRate/channelCount/sampleSize constraints.
+    // Safari (macOS + iOS) can feed the mic node all-zero buffers when
+    // echoCancellation is enabled and the codec2 worklet graph touches
+    // destination. Keep echo cancellation off there, but leave it on for
+    // other browsers so background noise is reduced in normal relay use.
+    const safariFamily = isSafariFamilyBrowser();
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: {
-        echoCancellation: false,
+        echoCancellation: !safariFamily,
         noiseSuppression: true,
-        autoGainControl: true
+        autoGainControl: false
       },
       video: false
     });
@@ -521,6 +846,7 @@ async function ensureLocalAudio() {
     updateControls();
     log("Local microphone captured", {
       relayTransport: codec2.useRelayTransport(),
+      safariFamily,
       track: describeAudioTrack(stream.getAudioTracks()[0] || null)
     });
     return stream;
@@ -550,6 +876,12 @@ function stopLocalAudio() {
 function resetRemoteAudio() {
   state.remoteStream = new MediaStream();
   remoteAudio.srcObject = state.remoteStream;
+  for (const peerId of Array.from(peerContexts.keys())) {
+    destroyPeerContext(peerId);
+  }
+  updatePeerDisplay();
+  updateStatusFromPeerConnections();
+  updateControls();
 }
 
 function buildWebSocketUrl() {
@@ -586,19 +918,23 @@ function closePeerConnection() {
   // Keep the prewarmed AudioContext alive across reconnects so we don't lose
   // the original join-button user gesture that allowed it to start.
   codec2.teardown({ closeAudioContext: false });
-  if (state.peerConnection) {
-    state.peerConnection.onicecandidate = null;
-    state.peerConnection.ondatachannel = null;
-    state.peerConnection.ontrack = null;
-    state.peerConnection.onconnectionstatechange = null;
-    state.peerConnection.oniceconnectionstatechange = null;
-    state.peerConnection.close();
-  }
 
-  state.peerConnection = null;
-  state.pendingCandidates = [];
-  state.lastInboundBytes = 0;
-  state.lastStatsAt = 0;
+  for (const context of getPeerContexts()) {
+    clearPeerTimers(context);
+    if (context.connection) {
+      context.connection.onicecandidate = null;
+      context.connection.ondatachannel = null;
+      context.connection.ontrack = null;
+      context.connection.onconnectionstatechange = null;
+      context.connection.oniceconnectionstatechange = null;
+      context.connection.close();
+      context.connection = null;
+    }
+    clearPeerRemoteStream(context);
+    context.pendingCandidates = [];
+    context.lastInboundBytes = 0;
+    context.lastStatsAt = 0;
+  }
 }
 
 function cleanupIntervals() {
@@ -612,15 +948,16 @@ function cleanupIntervals() {
     state.heartbeatIntervalId = null;
   }
 
-  if (state.reconnectTimerId) {
-    clearTimeout(state.reconnectTimerId);
-    state.reconnectTimerId = null;
+  for (const context of getPeerContexts()) {
+    clearPeerTimers(context);
   }
 
   if (state.signalingReconnectTimerId) {
     clearTimeout(state.signalingReconnectTimerId);
     state.signalingReconnectTimerId = null;
   }
+
+  state.signalingReconnectAttempts = 0;
 }
 
 function resetStatsDisplay() {
@@ -657,6 +994,7 @@ function resetCallState({ preserveLog = true } = {}) {
   state.peerId = "";
   state.peerName = "";
   state.joined = false;
+  state.autoRejoinInFlight = false;
   state.role = "";
   state.roomId = "";
   state.participantId = "";
@@ -664,7 +1002,7 @@ function resetCallState({ preserveLog = true } = {}) {
   state.iceServers = null;
   state.muted = false;
   state.speakerUnlocked = false;
-  state.audioProfile = "lean";
+  state.audioProfile = getDefaultAudioProfileForMode(state.opusMode);
 
   if (state.pollAbortController) {
     state.pollAbortController.abort();
@@ -690,7 +1028,8 @@ function escapeRegex(value) {
 }
 
 function getActiveAudioProfile() {
-  return AUDIO_PROFILES[state.audioProfile] || AUDIO_PROFILES.lean;
+  const opusMode = getOpusModeConfig();
+  return opusMode.profiles[state.audioProfile] || opusMode.profiles[opusMode.defaultProfile];
 }
 
 function updateAudioSectionAttribute(section, attribute, value) {
@@ -724,6 +1063,69 @@ function tuneAudioPacketization(sdp, ptime) {
       let tuned = updateAudioSectionAttribute(section, "ptime", ptime);
       tuned = updateAudioSectionAttribute(tuned, "maxptime", ptime);
       return tuned;
+    })
+    .join("\r\n");
+}
+
+function preferRedForOpus(sdp) {
+  if (!sdp) {
+    return sdp;
+  }
+
+  const sections = sdp.split(/\r\n(?=m=)/);
+  return sections
+    .map((section) => {
+      if (!section.startsWith("m=audio ")) {
+        return section;
+      }
+
+      const opusMatch = section.match(/^a=rtpmap:(\d+) opus\/48000\/2$/m);
+      if (!opusMatch) {
+        return section;
+      }
+
+      const opusPayloadType = opusMatch[1];
+      const redPayloadTypes = Array.from(section.matchAll(/^a=rtpmap:(\d+) red\/48000\/2$/gm))
+        .map((match) => match[1])
+        .filter((payloadType) => {
+          const fmtpMatch = section.match(
+            new RegExp(`^a=fmtp:${escapeRegex(payloadType)}\\s+(.+)$`, "m")
+          );
+          if (!fmtpMatch) {
+            return false;
+          }
+          return fmtpMatch[1]
+            .split(";")
+            .map((part) => part.trim())
+            .includes(`apt=${opusPayloadType}`);
+        });
+
+      if (redPayloadTypes.length === 0) {
+        return section;
+      }
+
+      return section.replace(
+        /^m=audio\s+(\d+)\s+([A-Z0-9/]+)\s+(.+)$/m,
+        (line, port, protocol, payloadList) => {
+          const payloadTypes = payloadList.trim().split(/\s+/);
+          if (!payloadTypes.includes(opusPayloadType)) {
+            return line;
+          }
+
+          const preferred = redPayloadTypes.filter((payloadType) => payloadTypes.includes(payloadType));
+          if (preferred.length === 0) {
+            return line;
+          }
+
+          const preferredSet = new Set([...preferred, opusPayloadType]);
+          const reordered = [
+            ...preferred,
+            opusPayloadType,
+            ...payloadTypes.filter((payloadType) => !preferredSet.has(payloadType))
+          ];
+          return `m=audio ${port} ${protocol} ${reordered.join(" ")}`;
+        }
+      );
     })
     .join("\r\n");
 }
@@ -777,40 +1179,48 @@ function tuneOpusInSdp(sdp) {
     sdp = sdp.replace(fmtpRegex, `a=fmtp:${payloadType} ${value}`);
   }
 
-  return tuneAudioPacketization(sdp, activeProfile.ptime);
+  return tuneAudioPacketization(preferRedForOpus(sdp), activeProfile.ptime);
 }
 
 async function applySenderParameters() {
-  if (!state.peerConnection) {
+  const contexts = getPeerContexts().filter((context) => context.connection);
+  if (contexts.length === 0) {
     return;
-  }
-
-  const sender = state.peerConnection
-    .getSenders()
-    .find((item) => item.track && item.track.kind === "audio");
-
-  if (!sender || typeof sender.getParameters !== "function") {
-    return;
-  }
-
-  const params = sender.getParameters();
-  if (!params.encodings || params.encodings.length === 0) {
-    params.encodings = [{}];
   }
 
   const activeProfile = getActiveAudioProfile();
-  params.encodings[0].maxBitrate = activeProfile.maxBitrate;
-  params.encodings[0].networkPriority = "high";
+  for (const context of contexts) {
+    const sender = context.connection
+      .getSenders()
+      .find((item) => item.track && item.track.kind === "audio");
 
-  try {
-    await sender.setParameters(params);
-    log("Audio compression profile applied", {
-      profile: state.audioProfile,
-      bitrate: activeProfile.maxBitrate
-    });
-  } catch (error) {
-    log("Sender parameter tuning skipped", { message: error.message });
+    if (!sender || typeof sender.getParameters !== "function") {
+      continue;
+    }
+
+    const params = sender.getParameters();
+    if (!params.encodings || params.encodings.length === 0) {
+      params.encodings = [{}];
+    }
+
+    params.encodings[0].maxBitrate = activeProfile.maxBitrate;
+    params.encodings[0].networkPriority = "high";
+
+    try {
+      await sender.setParameters(params);
+    } catch (error) {
+      log("Sender parameter tuning skipped", {
+        peerId: context.id,
+        message: error.message
+      });
+    }
   }
+
+  log("Audio compression profile applied", {
+    profile: state.audioProfile,
+    bitrate: activeProfile.maxBitrate,
+    peers: contexts.length
+  });
 }
 
 function pickAudioProfile({
@@ -876,8 +1286,10 @@ function pickAudioProfile({
 
 async function adaptAudioCompression(metrics) {
   const nextProfile = pickAudioProfile(metrics);
-  // Under relay transport, codec2/FARGAN is always desired regardless of profile.
-  const desiredCodec2 = codec2.useRelayTransport() || nextProfile === "extreme";
+  // Under relay transport, codec2/FARGAN is always desired regardless of profile,
+  // but only on single-peer calls because the current codec2 pipeline is singleton.
+  const desiredCodec2 = shouldUseCodec2ForCurrentTopology() &&
+    (codec2.useRelayTransport() || nextProfile === "extreme");
   if (nextProfile === state.audioProfile) {
     await codec2.setDesiredActive(desiredCodec2);
     return;
@@ -899,9 +1311,65 @@ async function adaptAudioCompression(metrics) {
   await codec2.setDesiredActive(desiredCodec2);
 }
 
-async function createPeerConnection() {
-  closePeerConnection();
-  resetRemoteAudio();
+async function syncCodec2ForTopology() {
+  if (!shouldUseCodec2ForCurrentTopology()) {
+    codec2.teardown({ closeAudioContext: false });
+    return;
+  }
+
+  const onlyContext = getPeerContexts()[0] || null;
+  if (!onlyContext?.connection || !state.localStream) {
+    return;
+  }
+
+  await codec2.init(onlyContext.connection, state.localStream, {
+    initiator: shouldInitiateOfferForPeer(onlyContext.id)
+  });
+}
+
+function syncPeersFromSnapshot(peers = []) {
+  const liveIds = new Set();
+  for (const peer of peers) {
+    if (!peer?.id || peer.id === state.participantId) {
+      continue;
+    }
+    ensurePeerContext(peer.id, peer.displayName || peer.id);
+    liveIds.add(peer.id);
+  }
+
+  for (const context of getPeerContexts()) {
+    if (!liveIds.has(context.id)) {
+      destroyPeerContext(context.id);
+    }
+  }
+
+  updatePeerDisplay();
+  updateControls();
+}
+
+async function createPeerConnection(peerId, { replace = false } = {}) {
+  const context = ensurePeerContext(peerId);
+  if (!context) {
+    return null;
+  }
+
+  if (replace && context.connection) {
+    clearPeerTimers(context);
+    context.connection.onicecandidate = null;
+    context.connection.ondatachannel = null;
+    context.connection.ontrack = null;
+    context.connection.onconnectionstatechange = null;
+    context.connection.oniceconnectionstatechange = null;
+    context.connection.close();
+    context.connection = null;
+    context.pendingCandidates = [];
+    context.candidateBatch = [];
+    clearPeerRemoteStream(context);
+  }
+
+  if (context.connection) {
+    return context.connection;
+  }
 
   const connection = new RTCPeerConnection({
     iceServers: state.iceServers || DEFAULT_ICE_SERVERS,
@@ -909,35 +1377,37 @@ async function createPeerConnection() {
     rtcpMuxPolicy: "require"
   });
 
-  let candidateBatch = [];
-  let candidateFlushTimer = null;
-
   function flushCandidates() {
-    candidateFlushTimer = null;
-    if (candidateBatch.length === 0) {
+    context.candidateFlushTimerId = null;
+    if (context.candidateBatch.length === 0) {
       return;
     }
-    const batch = candidateBatch;
-    candidateBatch = [];
-    sendSignal("candidates", { candidates: batch });
+    const batch = context.candidateBatch;
+    context.candidateBatch = [];
+    sendSignal("candidates", { candidates: batch }, context.id).catch((error) => {
+      log("Candidate batch send failed", {
+        peerId: context.id,
+        message: error.message
+      });
+    });
   }
 
   connection.onicecandidate = (event) => {
-    if (!event.candidate || !state.peerId) {
-      if (!event.candidate && candidateBatch.length > 0) {
+    if (!event.candidate) {
+      if (context.candidateBatch.length > 0) {
         flushCandidates();
       }
       return;
     }
 
-    const c = event.candidate;
-    if (c.candidate.includes(".local") || c.candidate.includes(" host ")) {
+    const candidate = event.candidate;
+    if (candidate.candidate.includes(".local") || candidate.candidate.includes(" host ")) {
       return;
     }
 
-    candidateBatch.push(c);
-    if (!candidateFlushTimer) {
-      candidateFlushTimer = setTimeout(flushCandidates, 200);
+    context.candidateBatch.push(candidate);
+    if (!context.candidateFlushTimerId) {
+      context.candidateFlushTimerId = window.setTimeout(flushCandidates, 200);
     }
   };
 
@@ -945,113 +1415,143 @@ async function createPeerConnection() {
     if (event.streams && event.streams.length > 0) {
       for (const stream of event.streams) {
         for (const track of stream.getTracks()) {
-          if (!state.remoteStream.getTracks().some((item) => item.id === track.id)) {
-            state.remoteStream.addTrack(track);
+          if (!context.remoteStream.getTracks().some((item) => item.id === track.id)) {
+            context.remoteStream.addTrack(track);
           }
         }
       }
     } else if (
       event.track &&
-      !state.remoteStream.getTracks().some((track) => track.id === event.track.id)
+      !context.remoteStream.getTracks().some((track) => track.id === event.track.id)
     ) {
-      state.remoteStream.addTrack(event.track);
+      context.remoteStream.addTrack(event.track);
     }
+
     if (event.track) {
       log("Remote track received", {
+        peerId: context.id,
         id: event.track.id,
         kind: event.track.kind,
         muted: event.track.muted,
         readyState: event.track.readyState
       });
       event.track.onunmute = () => {
-        log("Remote track unmuted", { id: event.track.id });
+        log("Remote track unmuted", { peerId: context.id, id: event.track.id });
       };
       event.track.onmute = () => {
-        log("Remote track muted", { id: event.track.id });
+        log("Remote track muted", { peerId: context.id, id: event.track.id });
       };
       event.track.onended = () => {
-        log("Remote track ended", { id: event.track.id });
+        log("Remote track ended", { peerId: context.id, id: event.track.id });
       };
     }
+
     unlockSpeaker().catch((error) => {
       log("Remote audio playback may need a tap", { message: error.message });
     });
-    updateStatus("Connected");
+    updateStatusFromPeerConnections();
   };
 
   connection.onconnectionstatechange = () => {
-    updateStatus(connection.connectionState);
-    log("Connection state changed", { state: connection.connectionState });
+    log("Connection state changed", {
+      peerId: context.id,
+      state: connection.connectionState
+    });
+    updateStatusFromPeerConnections();
 
     if (
       connection.connectionState === "failed" ||
       connection.connectionState === "disconnected"
     ) {
-      scheduleIceRestart();
+      scheduleIceRestart(context.id);
     }
   };
 
   connection.oniceconnectionstatechange = () => {
-    log("ICE state changed", { state: connection.iceConnectionState });
+    log("ICE state changed", {
+      peerId: context.id,
+      state: connection.iceConnectionState
+    });
     if (connection.iceConnectionState === "failed") {
-      scheduleIceRestart();
+      scheduleIceRestart(context.id);
     }
   };
 
   const stream = await ensureLocalAudio();
+  const useCodec2Transport = shouldUseCodec2ForCurrentTopology() && codec2.useRelayTransport();
   for (const track of stream.getAudioTracks()) {
-    const senderTrack = codec2.useRelayTransport() ? track.clone() : track;
+    const senderTrack = useCodec2Transport ? track.clone() : track;
     senderTrack.enabled = !state.muted;
     const senderStream = senderTrack === track ? stream : new MediaStream([senderTrack]);
     connection.addTrack(senderTrack, senderStream);
   }
 
-  state.peerConnection = connection;
+  context.connection = connection;
+  context.lastInboundBytes = 0;
+  context.lastStatsAt = 0;
   await applySenderParameters();
-  await codec2.init(connection, stream, { initiator: shouldInitiateOffer() });
+  await syncCodec2ForTopology();
+  updatePeerDisplay();
+  updateStatusFromPeerConnections();
   updateControls();
+  return connection;
 }
 
-async function createAndSendOffer({ iceRestart = false } = {}) {
-  if (!state.peerConnection || !state.peerId) {
+async function createAndSendOffer(peerId, { iceRestart = false } = {}) {
+  const context = getPeerContext(peerId);
+  if (!context?.connection) {
+    return;
+  }
+  if (
+    !iceRestart &&
+    (context.connection.localDescription || context.connection.remoteDescription)
+  ) {
+    return;
+  }
+  if (context.connection.signalingState !== "stable" && !iceRestart) {
     return;
   }
 
-  const offer = await state.peerConnection.createOffer({ iceRestart });
+  const offer = await context.connection.createOffer({ iceRestart });
   offer.sdp = tuneOpusInSdp(offer.sdp);
-  await state.peerConnection.setLocalDescription(offer);
-  const ld = state.peerConnection.localDescription;
+  await context.connection.setLocalDescription(offer);
+  const localDescription = context.connection.localDescription;
   await sendSignal("offer", {
-    description: { type: ld.type, sdp: ld.sdp }
-  });
+    description: { type: localDescription.type, sdp: localDescription.sdp }
+  }, context.id);
   updateStatus(iceRestart ? "Reconnecting" : "Connecting");
-  log(iceRestart ? "Sent ICE restart offer" : "Sent offer");
+  log(iceRestart ? "Sent ICE restart offer" : "Sent offer", { peerId: context.id });
 }
 
 async function handleOffer(from, payload) {
-  state.peerId = from;
-  await createPeerConnection();
+  const context = ensurePeerContext(from);
+  if (!context) {
+    return;
+  }
+
+  const connection = await createPeerConnection(from);
   updateControls();
 
   const description = {
     type: payload.description.type,
     sdp: payload.description.sdp
   };
-  await state.peerConnection.setRemoteDescription(description);
-  await flushPendingCandidates();
+  await connection.setRemoteDescription(description);
+  await flushPendingCandidates(from);
 
-  const answer = await state.peerConnection.createAnswer();
+  const answer = await connection.createAnswer();
   answer.sdp = tuneOpusInSdp(answer.sdp);
-  await state.peerConnection.setLocalDescription(answer);
-  const ald = state.peerConnection.localDescription;
+  await connection.setLocalDescription(answer);
+  const localDescription = connection.localDescription;
   await sendSignal("answer", {
-    description: { type: ald.type, sdp: ald.sdp }
-  });
-  log("Accepted offer and sent answer");
+    description: { type: localDescription.type, sdp: localDescription.sdp }
+  }, context.id);
+  log("Accepted offer and sent answer", { peerId: context.id });
 }
 
-async function handleAnswer(payload) {
-  if (!state.peerConnection) {
+async function handleAnswer(from, payload) {
+  const context = getPeerContext(from);
+  if (!context?.connection) {
     return;
   }
 
@@ -1059,47 +1559,53 @@ async function handleAnswer(payload) {
     type: payload.description.type,
     sdp: payload.description.sdp
   };
-  await state.peerConnection.setRemoteDescription(description);
-  await flushPendingCandidates();
-  log("Remote answer applied");
+  await context.connection.setRemoteDescription(description);
+  await flushPendingCandidates(from);
+  log("Remote answer applied", { peerId: context.id });
 }
 
-async function addSingleCandidate(candidate) {
-  if (
-    state.peerConnection &&
-    state.peerConnection.remoteDescription &&
-    state.peerConnection.remoteDescription.type
-  ) {
-    await state.peerConnection.addIceCandidate(candidate);
+async function addSingleCandidate(peerId, candidate) {
+  const context = ensurePeerContext(peerId);
+  if (!context) {
     return;
   }
-  state.pendingCandidates.push(candidate);
+
+  if (
+    context.connection &&
+    context.connection.remoteDescription &&
+    context.connection.remoteDescription.type
+  ) {
+    await context.connection.addIceCandidate(candidate);
+    return;
+  }
+  context.pendingCandidates.push(candidate);
 }
 
-async function handleCandidate(payload) {
+async function handleCandidate(from, payload) {
   if (payload.candidate) {
-    await addSingleCandidate(payload.candidate);
+    await addSingleCandidate(from, payload.candidate);
   }
 }
 
-async function handleCandidates(payload) {
+async function handleCandidates(from, payload) {
   const candidates = payload.candidates;
   if (!Array.isArray(candidates)) {
     return;
   }
   for (const candidate of candidates) {
-    await addSingleCandidate(candidate);
+    await addSingleCandidate(from, candidate);
   }
 }
 
-async function flushPendingCandidates() {
-  if (!state.peerConnection || !state.peerConnection.remoteDescription) {
+async function flushPendingCandidates(peerId) {
+  const context = getPeerContext(peerId);
+  if (!context?.connection || !context.connection.remoteDescription) {
     return;
   }
 
-  while (state.pendingCandidates.length > 0) {
-    const candidate = state.pendingCandidates.shift();
-    await state.peerConnection.addIceCandidate(candidate);
+  while (context.pendingCandidates.length > 0) {
+    const candidate = context.pendingCandidates.shift();
+    await context.connection.addIceCandidate(candidate);
   }
 }
 
@@ -1113,21 +1619,25 @@ function sendSocketPayload(payload) {
 }
 
 async function handleRoomSync(message) {
-  const remotePeer = message.peers?.[0];
-  state.peerId = remotePeer?.id || "";
-  state.peerName = remotePeer?.displayName || "";
-  updateControls();
+  state.signalingReconnectAttempts = 0;
+  const peers = Array.isArray(message.peers) ? message.peers : [];
+  syncPeersFromSnapshot(peers);
   log("Room sync received", {
-    peers: message.peers?.length || 0,
+    peers: peers.length,
     signaling: "websocket"
   });
 
-  if (state.peerId && !state.peerConnection) {
-    await createPeerConnection();
+  for (const peer of peers) {
+    await createPeerConnection(peer.id);
   }
 
-  if (state.peerId && shouldInitiateOffer()) {
-    await createAndSendOffer();
+  await syncCodec2ForTopology();
+  updateStatusFromPeerConnections();
+
+  for (const peer of peers) {
+    if (shouldInitiateOfferForPeer(peer.id)) {
+      await createAndSendOffer(peer.id);
+    }
   }
 }
 
@@ -1142,6 +1652,11 @@ async function handleSocketMessage(message) {
       break;
     case "error":
       log("Signaling error", { message: message.error });
+      if (message.error === "Participant not found") {
+        attemptAutoRejoin("signaling participant timeout").catch((error) => {
+          log("Auto-rejoin failed", { message: error.message });
+        });
+      }
       break;
     default:
       await handleEvent(message);
@@ -1170,8 +1685,25 @@ function startHeartbeat() {
       });
     } catch (error) {
       log("Heartbeat failed", { message: error.message });
+      if (error.message === "Participant not found") {
+        attemptAutoRejoin("heartbeat timeout").catch((rejoinError) => {
+          log("Heartbeat auto-rejoin failed", { message: rejoinError.message });
+        });
+      }
     }
   }, 15000);
+}
+
+function getSignalingReconnectDelayMs() {
+  const attempt = Math.max(0, state.signalingReconnectAttempts);
+  const baseDelayMs = 2000;
+  const capDelayMs = Math.max(
+    baseDelayMs,
+    Number(window.APP_CONFIG?.maxReconnectDelayMs || 15000)
+  );
+  const exponentialDelayMs = Math.min(capDelayMs, baseDelayMs * (2 ** attempt));
+  const jitterFactor = 0.85 + (Math.random() * 0.3);
+  return Math.round(exponentialDelayMs * jitterFactor);
 }
 
 function scheduleSignalingReconnect() {
@@ -1179,13 +1711,68 @@ function scheduleSignalingReconnect() {
     return;
   }
 
+  const delayMs = getSignalingReconnectDelayMs();
+  const attemptNumber = state.signalingReconnectAttempts + 1;
+  log("Scheduling signaling reconnect", {
+    attempt: attemptNumber,
+    delayMs
+  });
+  state.signalingReconnectAttempts = attemptNumber;
+
   state.signalingReconnectTimerId = window.setTimeout(() => {
     state.signalingReconnectTimerId = null;
     connectSignalingSocket().catch((error) => {
       log("Signaling reconnect failed", { message: error.message });
       scheduleSignalingReconnect();
     });
-  }, window.APP_CONFIG?.maxReconnectDelayMs || 5000);
+  }, delayMs);
+}
+
+async function attemptAutoRejoin(reason) {
+  if (
+    state.autoRejoinInFlight ||
+    !state.joined ||
+    !state.roomId ||
+    !state.displayName
+  ) {
+    return;
+  }
+
+  state.autoRejoinInFlight = true;
+  log("Attempting automatic rejoin", { reason, roomId: state.roomId });
+  updateStatus("Rejoining");
+  cleanupIntervals();
+  closeSignalingSocket();
+  closePeerConnection();
+  resetRemoteAudio();
+
+  try {
+    await ensureLocalAudio();
+    const payload = await request(`/api/rooms/${encodeURIComponent(state.roomId)}/join`, {
+      method: "POST",
+      body: JSON.stringify({ displayName: state.displayName })
+    });
+
+    state.participantId = payload.participant.id;
+    state.iceServers = payload.iceServers || DEFAULT_ICE_SERVERS;
+    state.role = payload.role;
+    state.signalingReconnectAttempts = 0;
+    syncPeersFromSnapshot(payload.peers || []);
+    updateStatus(getPeerContexts().length > 0 ? "Reconnecting" : "Waiting for participants");
+
+    // Let the authenticated room-sync snapshot own connection setup so we do
+    // not duplicate offer generation from both the join response and the socket.
+    await connectSignalingSocket();
+
+    startHeartbeat();
+    startStatsLoop();
+    log("Automatic rejoin completed", {
+      roomId: state.roomId,
+      participantId: state.participantId
+    });
+  } finally {
+    state.autoRejoinInFlight = false;
+  }
 }
 
 async function connectSignalingSocket() {
@@ -1198,19 +1785,22 @@ async function connectSignalingSocket() {
     socket.onopen = () => {
       state.signalingSocket = socket;
       state.signalingConnected = true;
+      state.signalingReconnectAttempts = 0;
       sendSocketPayload({
         type: "auth",
         roomId: state.roomId,
         participantId: state.participantId
       });
       log("Signaling socket connected");
-      settled = true;
-      resolve();
     };
 
     socket.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data);
+        if (!settled && message?.type === "room-sync") {
+          settled = true;
+          resolve();
+        }
         handleSocketMessage(message).catch((error) => {
           log("Socket message handling failed", { message: error.message });
         });
@@ -1247,7 +1837,7 @@ async function connectSignalingSocket() {
   });
 }
 
-async function sendSignal(type, payload) {
+async function sendSignal(type, payload, targetId) {
   if (!state.roomId || !state.participantId) {
     return;
   }
@@ -1256,7 +1846,7 @@ async function sendSignal(type, payload) {
     sendSocketPayload({
       type: "signal",
       signalType: type,
-      targetId: state.peerId || undefined,
+      targetId: targetId || undefined,
       payload
     })
   ) {
@@ -1267,28 +1857,29 @@ async function sendSignal(type, payload) {
     method: "POST",
     body: JSON.stringify({
       participantId: state.participantId,
-      targetId: state.peerId || undefined,
+      targetId: targetId || undefined,
       type,
       payload
     })
   });
 }
 
-async function scheduleIceRestart() {
-  if (!shouldInitiateOffer() || state.reconnectTimerId || !state.peerId) {
+async function scheduleIceRestart(peerId) {
+  const context = getPeerContext(peerId);
+  if (!context || !shouldInitiateOfferForPeer(peerId) || context.reconnectTimerId) {
     return;
   }
 
-  state.reconnectTimerId = window.setTimeout(async () => {
-    state.reconnectTimerId = null;
-    if (!state.peerConnection || !state.peerId) {
+  context.reconnectTimerId = window.setTimeout(async () => {
+    context.reconnectTimerId = null;
+    if (!context.connection) {
       return;
     }
 
     try {
-      await createAndSendOffer({ iceRestart: true });
+      await createAndSendOffer(peerId, { iceRestart: true });
     } catch (error) {
-      log("ICE restart failed", { message: error.message });
+      log("ICE restart failed", { peerId, message: error.message });
     }
   }, 2000);
 }
@@ -1296,43 +1887,38 @@ async function scheduleIceRestart() {
 async function handleEvent(event) {
   switch (event.type) {
     case "peer-joined":
-      state.peerId = event.peer.id;
-      state.peerName = event.peer.displayName;
+      ensurePeerContext(event.peer.id, event.peer.displayName);
       updatePeerDisplay();
       log("Peer joined", event.peer);
-      if (!state.peerConnection) {
-        await createPeerConnection();
+      await createPeerConnection(event.peer.id);
+      await syncCodec2ForTopology();
+      if (shouldInitiateOfferForPeer(event.peer.id)) {
+        await createAndSendOffer(event.peer.id);
       }
-      if (shouldInitiateOffer()) {
-        await createAndSendOffer();
-      }
+      updateStatusFromPeerConnections();
       break;
     case "peer-left":
       log("Peer left", event.peer);
-      state.peerId = "";
-      state.peerName = "";
+      destroyPeerContext(event.peer.id);
       updatePeerDisplay();
-      closePeerConnection();
-      resetRemoteAudio();
-      updateStatus("Waiting for peer");
+      await syncCodec2ForTopology();
+      updateStatusFromPeerConnections();
       updateControls();
       break;
     case "signal":
-      if (event.from && !state.peerId) {
-        state.peerId = event.from;
-      }
+      ensurePeerContext(event.from, event.peer?.displayName || event.from);
       switch (event.signal.type) {
         case "offer":
           await handleOffer(event.from, event.signal.payload);
           break;
         case "answer":
-          await handleAnswer(event.signal.payload);
+          await handleAnswer(event.from, event.signal.payload);
           break;
         case "candidate":
-          await handleCandidate(event.signal.payload);
+          await handleCandidate(event.from, event.signal.payload);
           break;
         case "candidates":
-          await handleCandidates(event.signal.payload);
+          await handleCandidates(event.from, event.signal.payload);
           break;
         default:
           log("Ignored unknown signal", event.signal);
@@ -1349,34 +1935,70 @@ function startStatsLoop() {
   }
 
   state.statsIntervalId = window.setInterval(async () => {
-    if (!state.peerConnection) {
+    const contexts = getPeerContexts().filter((context) => context.connection);
+    if (contexts.length === 0) {
       return;
     }
 
     try {
-      const stats = await state.peerConnection.getStats();
       let packetsLost = null;
       let jitter = null;
       let rtt = null;
-      let inboundBytes = null;
       let availableOutgoingBitrate = null;
+      let aggregateBitrateKbps = 0;
 
-      stats.forEach((report) => {
-        if (report.type === "inbound-rtp" && report.kind === "audio") {
-          packetsLost = report.packetsLost;
-          jitter = report.jitter;
-          inboundBytes = report.bytesReceived;
+      for (const context of contexts) {
+        const stats = await context.connection.getStats();
+        let peerPacketsLost = null;
+        let peerJitter = null;
+        let peerRtt = null;
+        let inboundBytes = null;
+        let peerAvailableOutgoingBitrate = null;
+
+        stats.forEach((report) => {
+          if (report.type === "inbound-rtp" && report.kind === "audio") {
+            peerPacketsLost = report.packetsLost;
+            peerJitter = report.jitter;
+            inboundBytes = report.bytesReceived;
+          }
+
+          if (
+            report.type === "candidate-pair" &&
+            report.state === "succeeded" &&
+            report.nominated
+          ) {
+            peerRtt = report.currentRoundTripTime;
+            peerAvailableOutgoingBitrate = report.availableOutgoingBitrate;
+          }
+        });
+
+        if (typeof peerPacketsLost === "number") {
+          packetsLost = packetsLost == null ? peerPacketsLost : Math.max(packetsLost, peerPacketsLost);
+        }
+        if (typeof peerJitter === "number") {
+          jitter = jitter == null ? peerJitter : Math.max(jitter, peerJitter);
+        }
+        if (typeof peerRtt === "number") {
+          rtt = rtt == null ? peerRtt : Math.max(rtt, peerRtt);
+        }
+        if (typeof peerAvailableOutgoingBitrate === "number") {
+          availableOutgoingBitrate =
+            availableOutgoingBitrate == null
+              ? peerAvailableOutgoingBitrate
+              : Math.min(availableOutgoingBitrate, peerAvailableOutgoingBitrate);
         }
 
-        if (
-          report.type === "candidate-pair" &&
-          report.state === "succeeded" &&
-          report.nominated
-        ) {
-          rtt = report.currentRoundTripTime;
-          availableOutgoingBitrate = report.availableOutgoingBitrate;
+        if (typeof inboundBytes === "number") {
+          const currentTime = performance.now();
+          if (context.lastStatsAt && inboundBytes >= context.lastInboundBytes) {
+            const seconds = (currentTime - context.lastStatsAt) / 1000;
+            const bits = (inboundBytes - context.lastInboundBytes) * 8;
+            aggregateBitrateKbps += bits / seconds / 1000;
+          }
+          context.lastInboundBytes = inboundBytes;
+          context.lastStatsAt = currentTime;
         }
-      });
+      }
 
       if (typeof packetsLost === "number") {
         lossText.textContent = String(packetsLost);
@@ -1390,15 +2012,8 @@ function startStatsLoop() {
         rttText.textContent = `${Math.round(rtt * 1000)} ms`;
       }
 
-      if (typeof inboundBytes === "number") {
-        const currentTime = performance.now();
-        if (state.lastStatsAt && inboundBytes >= state.lastInboundBytes) {
-          const seconds = (currentTime - state.lastStatsAt) / 1000;
-          const bits = (inboundBytes - state.lastInboundBytes) * 8;
-          bitrateText.textContent = `${Math.round(bits / seconds / 1000)} kbps`;
-        }
-        state.lastInboundBytes = inboundBytes;
-        state.lastStatsAt = currentTime;
+      if (aggregateBitrateKbps > 0) {
+        bitrateText.textContent = `${Math.round(aggregateBitrateKbps)} kbps`;
       }
 
       await adaptAudioCompression({
@@ -1459,25 +2074,17 @@ async function joinRoom(event) {
     state.iceServers = payload.iceServers || DEFAULT_ICE_SERVERS;
     state.role = payload.role;
     state.joined = true;
-    state.peerId = payload.peers[0]?.id || "";
-    state.peerName = payload.peers[0]?.displayName || "";
-
-    updateStatus(state.peerId ? "Connecting" : "Waiting for peer");
-    updateControls();
+    syncPeersFromSnapshot(payload.peers || []);
+    updateStatus(getPeerContexts().length > 0 ? "Connecting" : "Waiting for participants");
     log("Joined room", {
       roomId: payload.roomId,
       role: payload.role,
       participantId: payload.participant.id
     });
 
+    // Let the authenticated room-sync snapshot own connection setup so we do
+    // not duplicate offer generation from both the join response and the socket.
     await connectSignalingSocket();
-
-    if (state.peerId) {
-      await createPeerConnection();
-      if (shouldInitiateOffer()) {
-        await createAndSendOffer();
-      }
-    }
 
     startHeartbeat();
     startStatsLoop();
@@ -1552,14 +2159,28 @@ if (speakerButton) {
 }
 if (reconnectButton) {
   reconnectButton.addEventListener("click", () => {
-    createAndSendOffer({ iceRestart: true }).catch((error) => {
-      log("Manual ICE restart failed", { message: error.message });
-    });
+    Promise.all(
+      getPeerContexts()
+        .filter((context) => shouldInitiateOfferForPeer(context.id))
+        .map((context) =>
+          createAndSendOffer(context.id, { iceRestart: true }).catch((error) => {
+            log("Manual ICE restart failed", {
+              peerId: context.id,
+              message: error.message
+            });
+          })
+        )
+    ).catch(() => {});
   });
 }
 if (clearLogButton) {
   clearLogButton.addEventListener("click", () => {
     logOutput.textContent = "";
+  });
+}
+if (opusModeSelect) {
+  opusModeSelect.addEventListener("change", (event) => {
+    applyOpusMode(event.target.value);
   });
 }
 
@@ -1594,6 +2215,7 @@ function rescueAudioContext() {
 });
 
 resetRemoteAudio();
+applyOpusMode(readStoredOpusMode(), { persist: false, resetProfile: true });
 (async () => {
   await refreshMicPermissionState().catch(() => "unknown");
 })();

@@ -1,6 +1,6 @@
 services:
   voiceai:
     environment:
-      ENABLE_MEDIA_RELAY: "true"
-      NEURAL_RELAY_MODE: fargan
-      NEURAL_RELAY_BACKEND: native-exec
+      ENABLE_MEDIA_RELAY: "false"
+      NEURAL_RELAY_MODE: off
+      NEURAL_RELAY_BACKEND: in-process

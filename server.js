@@ -17,12 +17,12 @@ const TLS_KEY_PATH = process.env.TLS_KEY_PATH || "";
 const TLS_CERT_PATH = process.env.TLS_CERT_PATH || "";
 const JSON_LIMIT_BYTES = 64 * 1024;
 const ROOM_IDLE_MS = Number(process.env.ROOM_IDLE_MS || 5 * 60 * 1000);
-const PARTICIPANT_IDLE_MS = Number(process.env.PARTICIPANT_IDLE_MS || 45 * 1000);
+const PARTICIPANT_IDLE_MS = Number(process.env.PARTICIPANT_IDLE_MS || 120 * 1000);
 const SHUTDOWN_GRACE_MS = Number(process.env.SHUTDOWN_GRACE_MS || 10000);
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
 const RATE_LIMIT_MAX_REQUESTS = Number(process.env.RATE_LIMIT_MAX_REQUESTS || 240);
 const MAX_EVENTS_PER_PARTICIPANT = Number(process.env.MAX_EVENTS_PER_PARTICIPANT || 128);
-const WS_PING_INTERVAL_MS = Number(process.env.WS_PING_INTERVAL_MS || 20_000);
+const WS_PING_INTERVAL_MS = Number(process.env.WS_PING_INTERVAL_MS || 10_000);
 const REDIS_URL = process.env.REDIS_URL || "";
 const REDIS_PREFIX = process.env.REDIS_PREFIX || "voiceai";
 const allowedOrigin = process.env.ALLOWED_ORIGIN || "";
@@ -34,10 +34,12 @@ const TURN_CREDENTIAL = process.env.TURN_CREDENTIAL || "";
 const AUTH_USERNAME = process.env.AUTH_USERNAME || "";
 const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "";
 const ENABLE_MEDIA_RELAY = /^(1|true|yes|on)$/i.test(String(process.env.ENABLE_MEDIA_RELAY || ""));
+const ENABLE_REMOTE_DEBUG_LOGS = /^(1|true|yes|on)$/i.test(String(process.env.ENABLE_REMOTE_DEBUG_LOGS || ""));
 const NEURAL_RELAY_MODE = String(process.env.NEURAL_RELAY_MODE || "off").trim().toLowerCase();
 const NEURAL_RELAY_BACKEND = String(process.env.NEURAL_RELAY_BACKEND || "in-process")
   .trim()
   .toLowerCase();
+const MEDIA_SOCKET_TOUCH_INTERVAL_MS = Number(process.env.MEDIA_SOCKET_TOUCH_INTERVAL_MS || 15000);
 
 let isShuttingDown = false;
 const rateLimits = new Map();
@@ -356,11 +358,12 @@ function appConfigScript({
       const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
       return urls.every((url) => !String(url).startsWith("turn:") && !String(url).startsWith("turns:"));
     }),
-    maxReconnectDelayMs: 5000,
+    maxReconnectDelayMs: 15000,
     wsPath: "/ws",
     mediaWsPath: "/media",
     enableCodec2: codec2Available,
     enableMediaRelay: codec2Available && ENABLE_MEDIA_RELAY,
+    enableRemoteDebugLogs: ENABLE_REMOTE_DEBUG_LOGS,
     neuralRelayMode: codec2Available ? neuralRelayMode : "off",
     neuralRelayBackend: codec2Available ? neuralRelayBackend : "disabled",
     neuralRelayRuntime: codec2Available ? neuralRelayRuntime : "disabled"
@@ -1078,6 +1081,10 @@ async function main() {
     // so we can monitor live without asking users to copy/paste. Best-effort,
     // never blocks the response.
     if (url.pathname === "/api/debug/log" && request.method === "POST") {
+      if (!ENABLE_REMOTE_DEBUG_LOGS) {
+        json(response, 204, {});
+        return true;
+      }
       readJsonBody(request)
         .then((body) => {
           const peer = String(body?.peer || "?").slice(0, 64);
@@ -1260,12 +1267,31 @@ async function main() {
     }
 
     registerMediaSocket(ws, roomId, participantId);
+    ws.lastParticipantTouchAt = now();
     console.log("[MEDIA] auth ok", { room: roomId, peer: participantId });
     sendSocketMessage(ws, {
       type: "media-ready",
       roomId,
       participant: participantSnapshot(participant)
     });
+  }
+
+  async function touchMediaParticipant(ws, { force = false } = {}) {
+    if (!ws?.roomId || !ws?.participantId) {
+      return null;
+    }
+
+    const currentTime = now();
+    const lastTouchAt = ws.lastParticipantTouchAt || 0;
+    if (!force && currentTime - lastTouchAt < MEDIA_SOCKET_TOUCH_INTERVAL_MS) {
+      return true;
+    }
+
+    const participant = await store.touchParticipant(ws.roomId, ws.participantId);
+    if (participant) {
+      ws.lastParticipantTouchAt = currentTime;
+    }
+    return participant;
   }
 
   wss.on("connection", (ws) => {
@@ -1349,6 +1375,7 @@ async function main() {
     ws.isAlive = true;
     ws.participantId = "";
     ws.roomId = "";
+    ws.lastParticipantTouchAt = 0;
     ws.__mediaFrameCount = 0;
     ws.__mediaFirstFrameAt = 0;
     console.log("[MEDIA] connection opened");
@@ -1366,7 +1393,7 @@ async function main() {
         }
 
         try {
-          await store.touchParticipant(ws.roomId, ws.participantId);
+          await touchMediaParticipant(ws);
           ws.__mediaFrameCount += 1;
           if (ws.__mediaFrameCount === 1) {
             ws.__mediaFirstFrameAt = Date.now();
@@ -1385,7 +1412,7 @@ async function main() {
       const raw = rawMessage.toString("utf-8");
       if (raw === "h") {
         if (ws.roomId && ws.participantId) {
-          await store.touchParticipant(ws.roomId, ws.participantId);
+          await touchMediaParticipant(ws, { force: true });
         }
         return;
       }
@@ -1405,7 +1432,7 @@ async function main() {
             break;
           case "heartbeat":
             if (ws.roomId && ws.participantId) {
-              await store.touchParticipant(ws.roomId, ws.participantId);
+              await touchMediaParticipant(ws, { force: true });
             }
             break;
           case "leave":

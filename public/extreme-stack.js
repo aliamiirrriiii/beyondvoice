@@ -342,17 +342,26 @@
       frameDurationMs = 20,
       sampleRate = DEFAULT_SAMPLE_RATE,
       maxFramesPerDrain = 6,
+      initialDelayFrames = 1,
+      minDelayFrames = 1,
+      maxDelayFrames = 4,
       plcModel = new FeatureTrajectoryPlcModel()
     } = {}) {
       this.frameDurationMs = frameDurationMs;
       this.sampleRate = sampleRate;
       this.maxFramesPerDrain = maxFramesPerDrain;
+      this.minDelayFrames = Math.max(1, Math.round(minDelayFrames));
+      this.maxDelayFrames = Math.max(this.minDelayFrames, Math.round(maxDelayFrames));
       this.plcModel = plcModel;
       this.queue = new Map();
       this.expectedSequenceNumber = null;
       this.playoutStartedAt = null;
       this.emittedFrames = 0;
-      this.targetDelayFrames = 2;
+      this.targetDelayFrames = clamp(
+        Math.round(initialDelayFrames),
+        this.minDelayFrames,
+        this.maxDelayFrames
+      );
       this.arrivalJitterMs = 0;
       this.lastArrivalTimeMs = null;
       this.lastPacketTimestamp = null;
@@ -378,12 +387,18 @@
         inferred,
         typeof jitterMs === "number" ? jitterMs : 0
       );
-      const lossPenalty = typeof packetsLost === "number" ? Math.min(packetsLost, 8) * 0.2 : 0;
-      const rttPenalty = typeof rttMs === "number" ? rttMs / 220 : 0;
+      const lossPenalty = typeof packetsLost === "number" ? Math.min(packetsLost, 8) * 0.08 : 0;
+      const rttPenalty =
+        typeof rttMs === "number" ? (Math.min(rttMs, 600) / 600) * 0.35 : 0;
       const delayFrames = clamp(
-        Math.round(2 + (effectiveJitter / this.frameDurationMs) + lossPenalty + rttPenalty),
-        2,
-        8
+        Math.round(
+          this.minDelayFrames +
+            ((effectiveJitter / this.frameDurationMs) * 0.6) +
+            lossPenalty +
+            rttPenalty
+        ),
+        this.minDelayFrames,
+        this.maxDelayFrames
       );
 
       this.targetDelayFrames = delayFrames;
