@@ -125,7 +125,6 @@ const joinButton = document.querySelector("#join-button");
 const leaveButton = document.querySelector("#leave-button");
 const muteButton = document.querySelector("#mute-button");
 const reconnectButton = document.querySelector("#reconnect-button");
-const speakerButton = document.querySelector("#speaker-button");
 const clearLogButton = document.querySelector("#clear-log-button");
 const micBadge = document.querySelector("#mic-badge");
 const micSummary = document.querySelector("#mic-summary");
@@ -172,7 +171,6 @@ const state = {
   autoRejoinInFlight: false,
   micPermissionState: "unknown",
   micPermissionStatus: null,
-  speakerUnlocked: false,
   opusMode: "balanced",
   audioProfile: "lean"
 };
@@ -760,11 +758,6 @@ function updateControls() {
   if (reconnectButton) {
     reconnectButton.disabled = !state.joined || peerContexts.size === 0;
   }
-  if (speakerButton) {
-    speakerButton.disabled = false;
-    speakerButton.classList.toggle("is-active", Boolean(state.speakerUnlocked));
-    setCtrlButtonLabel(speakerButton, state.speakerUnlocked ? "Ready" : "Speaker");
-  }
   if (roleText) {
     roleText.textContent = state.role || "—";
   }
@@ -777,43 +770,26 @@ function updateControls() {
   updatePeerDisplay();
 }
 
-async function unlockSpeaker({ userGesture = false } = {}) {
-  // Only a real user gesture should mark the speaker as "ready" before audio
-  // is actually flowing. Async ontrack handlers may attempt playback, but on
-  // iOS Safari those late autoplay attempts can still be rejected.
-  if (userGesture) {
-    state.speakerUnlocked = true;
-    updateControls();
-  }
-
+// Prime <audio>.play() for remote playback. Browsers (especially iOS Safari)
+// only allow play() inside a synchronous user-gesture stack — by the time a
+// remote WebRTC track arrives via ontrack, the gesture is gone, so we have to
+// prime the element earlier (from the Join click handler) and rely on
+// auto-resume when tracks are added to the already-playing srcObject. This is
+// also called from ontrack as a no-op fallback in case the prime succeeded.
+function primeRemoteAudio() {
   ensureRemotePlaybackStream();
   if (!remoteAudio) {
-    if (!userGesture) {
-      state.speakerUnlocked = false;
-      updateControls();
-    }
-    return false;
+    return;
   }
-
   try {
     const result = remoteAudio.play();
     if (result && typeof result.catch === "function") {
-      await result;
+      result.catch((error) => {
+        log("Remote audio autoplay deferred", { message: error.message });
+      });
     }
-    state.speakerUnlocked = !remoteAudio.paused;
-    updateControls();
-    if (userGesture) {
-      log("Speaker enabled");
-    }
-    return state.speakerUnlocked;
   } catch (error) {
-    if (!userGesture) {
-      state.speakerUnlocked = false;
-      updateControls();
-      return false;
-    }
-    log("Speaker unlock needs a user tap", { message: error.message });
-    return false;
+    log("Remote audio autoplay deferred", { message: error.message });
   }
 }
 
@@ -1209,7 +1185,6 @@ function resetCallState({ preserveLog = true } = {}) {
   state.displayName = "";
   state.iceServers = null;
   state.muted = false;
-  state.speakerUnlocked = false;
   state.audioProfile = getDefaultAudioProfileForMode(state.opusMode);
 
   if (state.pollAbortController) {
@@ -1626,9 +1601,7 @@ async function createPeerConnection(peerId, { replace = false } = {}) {
       };
     }
 
-    unlockSpeaker({ userGesture: false }).catch((error) => {
-      log("Remote audio playback may need a tap", { message: error.message });
-    });
+    primeRemoteAudio();
     updateStatusFromPeerConnections();
   };
 
@@ -2215,6 +2188,13 @@ async function joinRoom(event) {
     return;
   }
 
+  // Prime <audio>.play() while we are still inside the synchronous user
+  // gesture stack of the form submit. iOS Safari will only honour autoplay
+  // for elements that had play() called inside a real gesture; once we hit
+  // the first await below the gesture context is gone and any later play()
+  // attempt from ontrack will be rejected with NotAllowedError.
+  primeRemoteAudio();
+
   try {
     setMicStatus(
       "pending",
@@ -2303,13 +2283,6 @@ if (leaveButton) {
 }
 if (muteButton) {
   muteButton.addEventListener("click", toggleMute);
-}
-if (speakerButton) {
-  speakerButton.addEventListener("click", () => {
-    unlockSpeaker({ userGesture: true }).catch((error) => {
-      log("Speaker unlock failed", { message: error.message });
-    });
-  });
 }
 if (reconnectButton) {
   reconnectButton.addEventListener("click", () => {

@@ -255,6 +255,53 @@ async function run() {
       const missingTargetError = await missingTargetErrorPromise;
       assert.equal(missingTargetError.error, "Signal target not found");
 
+      // Verify that peer-joined is published only AFTER the joiner's WS auths.
+      // The bug we are guarding against is: if peer-joined fires from the HTTP
+      // join handler (before the joiner has opened /ws), existing peers react
+      // by sending offers that get silently dropped at the routing layer
+      // because the joiner's socket is not yet in socketsByParticipant.
+      const dianaJoin = await joinRoom(roomId, "Diana");
+      const aliceSeesDianaPromise = waitForSocketMessage(
+        aliceSocket.ws,
+        (message) => message?.type === "peer-joined" && message.peer?.id === dianaJoin.participant.id
+      );
+      // Diana has only completed the HTTP join. Existing peers must NOT yet see
+      // a peer-joined event for her — until her WebSocket is registered, any
+      // offer they sent in response would be lost.
+      await expectNoSocketMessage(
+        aliceSocket.ws,
+        (message) => message?.type === "peer-joined" && message.peer?.id === dianaJoin.participant.id,
+        300
+      );
+      const dianaSocket = await openSignalSocket(roomId, dianaJoin.participant.id);
+      try {
+        const aliceSeesDiana = await aliceSeesDianaPromise;
+        assert.equal(aliceSeesDiana.peer.displayName, "Diana");
+
+        // Now that Diana's socket is registered, an offer from an existing
+        // peer must route to her successfully.
+        const dianaOfferPromise = waitForSocketMessage(
+          dianaSocket.ws,
+          (message) =>
+            message?.type === "signal" &&
+            message.from === alice.participant.id &&
+            message.signal?.type === "offer"
+        );
+        aliceSocket.ws.send(JSON.stringify({
+          type: "signal",
+          signalType: "offer",
+          targetId: dianaJoin.participant.id,
+          payload: {
+            description: { type: "offer", sdp: "v=0\r\n" }
+          }
+        }));
+        const dianaOffer = await dianaOfferPromise;
+        assert.equal(dianaOffer.from, alice.participant.id);
+      } finally {
+        dianaSocket.ws.close();
+      }
+      await leaveRoom(roomId, dianaJoin.participant.id);
+
       const alicePeerLeftPromise = waitForSocketMessage(
         aliceSocket.ws,
         (message) => message?.type === "peer-left" && message.peer?.id === bob.participant.id

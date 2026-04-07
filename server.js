@@ -465,7 +465,11 @@ function createMemoryStore(publishEvent) {
       });
     }
 
-    if (room.participants.size === 0) {
+    // Only delete the room when pruning actually emptied it. Without the
+    // `stale.length > 0` guard a freshly-created (still empty) room would be
+    // wiped by the prune call inside joinRoom, leaving the just-added
+    // participant living on a dangling room object that no one else can find.
+    if (stale.length > 0 && room.participants.size === 0) {
       rooms.delete(room.id);
     }
 
@@ -494,10 +498,10 @@ function createMemoryStore(publishEvent) {
       room.participants.set(participant.id, participant);
       room.updatedAt = now();
 
-      await publishEvent(room.id, {
-        type: "peer-joined",
-        peer: participantSnapshot(participant)
-      });
+      // Note: peer-joined is intentionally NOT published here. It is published
+      // from authenticateSocket once the joiner's WebSocket is registered, so
+      // that any offer the existing peers send in response is guaranteed to
+      // route to a live socket instead of being silently dropped.
 
       return {
         roomId: room.id,
@@ -505,6 +509,16 @@ function createMemoryStore(publishEvent) {
         role,
         peers: liveParticipants.map(participantSnapshot)
       };
+    },
+    async notifyPeerJoined(roomId, participant) {
+      const room = getRoom(roomId);
+      if (!room || !participant) {
+        return;
+      }
+      await publishEvent(room.id, {
+        type: "peer-joined",
+        peer: participantSnapshot(participant)
+      });
     },
     async touchParticipant(roomId, participantId) {
       const room = getRoom(roomId);
@@ -650,10 +664,10 @@ function createRedisStore(commandClient, publishEvent) {
       const role = liveParticipants.length === 0 ? "host" : "guest";
       await persistParticipant(normalizedRoomId, participant);
 
-      await publishEvent(normalizedRoomId, {
-        type: "peer-joined",
-        peer: participantSnapshot(participant)
-      });
+      // Note: peer-joined is intentionally NOT published here. It is published
+      // from authenticateSocket once the joiner's WebSocket is registered, so
+      // that any offer the existing peers send in response is guaranteed to
+      // route to a live socket instead of being silently dropped.
 
       return {
         roomId: normalizedRoomId,
@@ -661,6 +675,22 @@ function createRedisStore(commandClient, publishEvent) {
         role,
         peers: liveParticipants.map(participantSnapshot)
       };
+    },
+    async notifyPeerJoined(roomId, participant) {
+      if (!participant) {
+        return;
+      }
+      const exists = await commandClient.hExists(
+        roomParticipantsKey(roomId),
+        String(participant.id || "").trim()
+      );
+      if (!exists) {
+        return;
+      }
+      await publishEvent(roomId, {
+        type: "peer-joined",
+        peer: participantSnapshot(participant)
+      });
     },
     async touchParticipant(roomId, participantId) {
       const normalizedParticipantId = String(participantId || "").trim();
@@ -686,18 +716,18 @@ function createRedisStore(commandClient, publishEvent) {
         .map(participantSnapshot);
     },
     async hasParticipant(roomId, participantId) {
-      return (
+      return Boolean(
         await commandClient.hExists(
           roomParticipantsKey(roomId),
           String(participantId || "").trim()
         )
-      ) === 1;
+      );
     },
     async publishSignal(roomId, fromId, targetId, signal) {
       const normalizedFromId = String(fromId || "").trim();
       const normalizedTargetId = String(targetId || "").trim();
       const senderExists = await commandClient.hExists(roomParticipantsKey(roomId), normalizedFromId);
-      if (senderExists !== 1) {
+      if (!senderExists) {
         return false;
       }
 
@@ -706,7 +736,7 @@ function createRedisStore(commandClient, publishEvent) {
           roomParticipantsKey(roomId),
           normalizedTargetId
         );
-        if (targetExists !== 1) {
+        if (!targetExists) {
           return false;
         }
       }
@@ -858,6 +888,15 @@ function routeEventLocally(roomId, event) {
     const ws = socketsByParticipant.get(event.targetId);
     if (ws && ws.roomId === roomId) {
       sendSocketMessage(ws, event);
+    } else {
+      console.log("[ROUTE-DROP]", {
+        room: roomId,
+        target: event.targetId,
+        type: event.type,
+        signalType: event.signal?.type,
+        from: event.from,
+        reason: ws ? "wrong-room" : "no-socket"
+      });
     }
     return;
   }
@@ -1240,6 +1279,7 @@ async function main() {
     }
 
     registerSocket(ws, roomId, participantId);
+    console.log("[AUTH-OK]", { room: roomId, peer: participantId });
     const peers = await store.getLivePeers(roomId, participantId);
     sendSocketMessage(ws, {
       type: "room-sync",
@@ -1247,6 +1287,12 @@ async function main() {
       participant: participantSnapshot(participant),
       peers
     });
+
+    // Announce the joiner to existing peers AFTER the joiner's WS is registered
+    // in socketsByParticipant, so any offer the existing peers send in response
+    // is guaranteed to route to a live socket instead of being silently dropped
+    // by routeEventLocally. See docs in joinRoom for the rationale.
+    await store.notifyPeerJoined(roomId, participant);
   }
 
   async function authenticateMediaSocket(ws, message) {
