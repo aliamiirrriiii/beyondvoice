@@ -460,6 +460,21 @@ function ensurePeerAudioElement(peerId) {
   audio.setAttribute("playsinline", "");
   audio.style.display = "none";
   document.body.appendChild(audio);
+
+  // If the user has already tapped Speaker, try to play immediately so the
+  // freshly-created element doesn't sit silent until the next user gesture.
+  // The browser may still reject this on iOS (no active gesture), but on
+  // Chrome/Firefox/desktop Safari one prior gesture in the page is enough.
+  if (state.speakerUnlocked) {
+    try {
+      const result = audio.play();
+      if (result && typeof result.catch === "function") {
+        result.catch(() => null);
+      }
+    } catch {
+      // ignore — autoplay will retry once srcObject gets tracks
+    }
+  }
   return audio;
 }
 
@@ -770,39 +785,40 @@ function updateControls() {
 }
 
 async function unlockSpeaker() {
+  // A tap on Speaker is a declaration of intent — record it immediately so
+  // the UI reflects the request even before any peer audio is flowing, and
+  // so that audio elements created later (e.g. when a peer joins after the
+  // tap) know they have permission to auto-play.
+  state.speakerUnlocked = true;
+  updateControls();
+
   const peerAudioElements = getPeerContexts()
     .map((context) => context.audioElement)
     .filter(Boolean);
-
-  if (!remoteAudio && peerAudioElements.length === 0) {
-    state.speakerUnlocked = false;
-    updateControls();
-    return;
-  }
-
   const mediaElements = [
     ...peerAudioElements,
     ...(remoteAudio ? [remoteAudio] : [])
   ];
-  const playableElements = mediaElements.filter((element) =>
-    (element.srcObject && element.srcObject.getTracks().length > 0) || element.src
+
+  // Best-effort: call play() on every existing audio element under the
+  // current user gesture. Empty elements (no tracks yet) will reject
+  // silently — that's fine, the call still authorizes them for autoplay
+  // once a track arrives later. Critical for iOS Safari, where each
+  // <audio> element must be activated by a user-gesture-bound play().
+  await Promise.all(
+    mediaElements.map((element) => {
+      try {
+        const result = element.play();
+        return result && typeof result.catch === "function"
+          ? result.catch(() => null)
+          : Promise.resolve();
+      } catch {
+        return Promise.resolve();
+      }
+    })
   );
 
-  if (playableElements.length === 0) {
-    state.speakerUnlocked = false;
-    updateControls();
-    return;
-  }
-
-  try {
-    await Promise.all(playableElements.map((element) => element.play().catch(() => null)));
-    state.speakerUnlocked = playableElements.some((element) => !element.paused);
-    log("Speaker playback unlocked");
-  } catch (error) {
-    state.speakerUnlocked = false;
-    log("Speaker unlock needs a user tap", { message: error.message });
-  }
-  updateControls();
+  log("Speaker enabled");
 }
 
 function setMicStatus(kind, summary, details) {
