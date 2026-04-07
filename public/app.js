@@ -447,35 +447,43 @@ function getPeerContexts() {
     .sort((left, right) => left.id.localeCompare(right.id));
 }
 
-function ensurePeerAudioElement(peerId) {
-  const elementId = `remote-audio-${peerId}`;
-  let audio = document.getElementById(elementId);
-  if (audio) {
-    return audio;
+function ensureRemotePlaybackStream() {
+  if (!state.remoteStream) {
+    state.remoteStream = new MediaStream();
+  }
+  if (remoteAudio && remoteAudio.srcObject !== state.remoteStream) {
+    remoteAudio.srcObject = state.remoteStream;
+  }
+  return state.remoteStream;
+}
+
+function attachTrackToPeer(context, track) {
+  if (!context || !track) {
+    return;
   }
 
-  audio = document.createElement("audio");
-  audio.id = elementId;
-  audio.autoplay = true;
-  audio.setAttribute("playsinline", "");
-  audio.style.display = "none";
-  document.body.appendChild(audio);
-
-  // If the user has already tapped Speaker, try to play immediately so the
-  // freshly-created element doesn't sit silent until the next user gesture.
-  // The browser may still reject this on iOS (no active gesture), but on
-  // Chrome/Firefox/desktop Safari one prior gesture in the page is enough.
-  if (state.speakerUnlocked) {
-    try {
-      const result = audio.play();
-      if (result && typeof result.catch === "function") {
-        result.catch(() => null);
-      }
-    } catch {
-      // ignore — autoplay will retry once srcObject gets tracks
-    }
+  const remoteStream = ensureRemotePlaybackStream();
+  if (!context.remoteTrackIds.has(track.id)) {
+    context.remoteTrackIds.add(track.id);
   }
-  return audio;
+  if (!remoteStream.getTracks().some((item) => item.id === track.id)) {
+    remoteStream.addTrack(track);
+  }
+}
+
+function detachTrackFromPeer(context, track) {
+  if (!context || !track || !state.remoteStream) {
+    return;
+  }
+
+  if (context.remoteTrackIds.has(track.id)) {
+    context.remoteTrackIds.delete(track.id);
+  }
+
+  const attachedTrack = state.remoteStream.getTracks().find((item) => item.id === track.id);
+  if (attachedTrack) {
+    state.remoteStream.removeTrack(attachedTrack);
+  }
 }
 
 function ensurePeerContext(peerId, displayName = "") {
@@ -486,15 +494,11 @@ function ensurePeerContext(peerId, displayName = "") {
 
   let context = peerContexts.get(normalizedPeerId);
   if (!context) {
-    const remoteStream = new MediaStream();
-    const audioElement = ensurePeerAudioElement(normalizedPeerId);
-    audioElement.srcObject = remoteStream;
     context = {
       id: normalizedPeerId,
       displayName: displayName || normalizedPeerId,
       connection: null,
-      remoteStream,
-      audioElement,
+      remoteTrackIds: new Set(),
       pendingCandidates: [],
       candidateBatch: [],
       candidateFlushTimerId: null,
@@ -505,10 +509,6 @@ function ensurePeerContext(peerId, displayName = "") {
     peerContexts.set(normalizedPeerId, context);
   } else if (displayName) {
     context.displayName = displayName;
-  }
-
-  if (context.audioElement && context.audioElement.srcObject !== context.remoteStream) {
-    context.audioElement.srcObject = context.remoteStream;
   }
 
   return context;
@@ -550,12 +550,15 @@ function getPeerContext(peerId) {
 }
 
 function clearPeerRemoteStream(context) {
-  if (!context?.remoteStream) {
+  if (!context?.remoteTrackIds?.size || !state.remoteStream) {
     return;
   }
-  for (const track of context.remoteStream.getTracks()) {
-    context.remoteStream.removeTrack(track);
+  for (const track of state.remoteStream.getTracks()) {
+    if (context.remoteTrackIds.has(track.id)) {
+      state.remoteStream.removeTrack(track);
+    }
   }
+  context.remoteTrackIds.clear();
 }
 
 function getPeerConnections() {
@@ -617,16 +620,6 @@ function destroyPeerContext(peerId) {
     context.connection.ondatachannel = null;
     context.connection.close();
     context.connection = null;
-  }
-
-  if (context.audioElement) {
-    try {
-      context.audioElement.pause();
-      context.audioElement.srcObject = null;
-      context.audioElement.remove();
-    } catch {
-      // best-effort cleanup
-    }
   }
 
   clearPeerRemoteStream(context);
@@ -786,37 +779,24 @@ function updateControls() {
 
 async function unlockSpeaker() {
   // A tap on Speaker is a declaration of intent — record it immediately so
-  // the UI reflects the request even before any peer audio is flowing, and
-  // so that audio elements created later (e.g. when a peer joins after the
-  // tap) know they have permission to auto-play.
+  // the UI reflects the request even before any peer audio is flowing.
+  // iOS Safari is much more reliable when all remote tracks stay attached
+  // to this single pre-existing <audio> element instead of late-created
+  // per-peer elements outside the original gesture chain.
   state.speakerUnlocked = true;
   updateControls();
 
-  const peerAudioElements = getPeerContexts()
-    .map((context) => context.audioElement)
-    .filter(Boolean);
-  const mediaElements = [
-    ...peerAudioElements,
-    ...(remoteAudio ? [remoteAudio] : [])
-  ];
-
-  // Best-effort: call play() on every existing audio element under the
-  // current user gesture. Empty elements (no tracks yet) will reject
-  // silently — that's fine, the call still authorizes them for autoplay
-  // once a track arrives later. Critical for iOS Safari, where each
-  // <audio> element must be activated by a user-gesture-bound play().
-  await Promise.all(
-    mediaElements.map((element) => {
-      try {
-        const result = element.play();
-        return result && typeof result.catch === "function"
-          ? result.catch(() => null)
-          : Promise.resolve();
-      } catch {
-        return Promise.resolve();
+  ensureRemotePlaybackStream();
+  if (remoteAudio) {
+    try {
+      const result = remoteAudio.play();
+      if (result && typeof result.catch === "function") {
+        await result.catch(() => null);
       }
-    })
-  );
+    } catch {
+      // best-effort: a later user gesture can retry
+    }
+  }
 
   log("Speaker enabled");
 }
@@ -1090,10 +1070,12 @@ function stopLocalAudio() {
 }
 
 function resetRemoteAudio() {
-  state.remoteStream = new MediaStream();
-  remoteAudio.srcObject = state.remoteStream;
+  const remoteStream = ensureRemotePlaybackStream();
   for (const peerId of Array.from(peerContexts.keys())) {
     destroyPeerContext(peerId);
+  }
+  for (const track of remoteStream.getTracks()) {
+    remoteStream.removeTrack(track);
   }
   updatePeerDisplay();
   updateStatusFromPeerConnections();
@@ -1603,16 +1585,11 @@ async function createPeerConnection(peerId, { replace = false } = {}) {
     if (event.streams && event.streams.length > 0) {
       for (const stream of event.streams) {
         for (const track of stream.getTracks()) {
-          if (!context.remoteStream.getTracks().some((item) => item.id === track.id)) {
-            context.remoteStream.addTrack(track);
-          }
+          attachTrackToPeer(context, track);
         }
       }
-    } else if (
-      event.track &&
-      !context.remoteStream.getTracks().some((track) => track.id === event.track.id)
-    ) {
-      context.remoteStream.addTrack(event.track);
+    } else if (event.track) {
+      attachTrackToPeer(context, event.track);
     }
 
     if (event.track) {
@@ -1630,6 +1607,7 @@ async function createPeerConnection(peerId, { replace = false } = {}) {
         log("Remote track muted", { peerId: context.id, id: event.track.id });
       };
       event.track.onended = () => {
+        detachTrackFromPeer(context, event.track);
         log("Remote track ended", { peerId: context.id, id: event.track.id });
       };
     }
