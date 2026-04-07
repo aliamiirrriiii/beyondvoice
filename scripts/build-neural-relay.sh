@@ -99,6 +99,16 @@ if [[ "$MODE" == "native-opus" ]]; then
   if [[ ! -f "$OPUS_INSTALL_DIR/lib/libopus.a" ]]; then
     rm -rf "$OPUS_BUILD_DIR" "$OPUS_INSTALL_DIR"
     mkdir -p "$OPUS_BUILD_DIR" "$OPUS_INSTALL_DIR"
+    # Mark autotools-generated artifacts as fresher than their sources so make
+    # does not try to regenerate them with a (possibly missing) aclocal/automake.
+    find "$PROJECT_DIR/vendor/opus" -type f \
+      \( -name 'configure.ac' -o -name 'Makefile.am' -o -name '*.m4' \) \
+      -exec touch -d '2000-01-01' {} +
+    touch "$PROJECT_DIR/vendor/opus/aclocal.m4" \
+          "$PROJECT_DIR/vendor/opus/configure" \
+          "$PROJECT_DIR/vendor/opus/Makefile.in" \
+          "$PROJECT_DIR/vendor/opus/doc/Makefile.in" \
+          "$PROJECT_DIR/vendor/opus/config.h.in"
     (
       cd "$OPUS_BUILD_DIR"
       "$PROJECT_DIR/vendor/opus/configure" \
