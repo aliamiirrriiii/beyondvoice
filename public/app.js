@@ -1631,6 +1631,7 @@ const codec2 = {
   codec2Track: null,
   codec2Stream: null,
   sourceNode: null,
+  captureDiag: null,
   samplesPerFrame: 0,
   bytesPerFrame: 0,
   frameDurationMs: 20,
@@ -2319,6 +2320,85 @@ const codec2 = {
       const source = audioCtx.createMediaStreamSource(codec2Stream);
       source.connect(encoderNode);
 
+      // === DIAG: capture-chain peak taps ===========================
+      // Two parallel AnalyserNodes (one branched off the same `source`
+      // that feeds the encoder, one created from a separate
+      // MediaStreamAudioSourceNode on the *uncloned* localStream) so we
+      // can pinpoint *where* the silence originates when peakAbs=0:
+      //   - codec2SourcePeak == rawLocalStreamPeak == 0  -> upstream
+      //     of WebAudio (track/device/OS is silent)
+      //   - codec2SourcePeak == 0, rawLocalStreamPeak > 0 -> the clone
+      //     is silent while the original has signal (clone bug)
+      //   - both > 0, but worklet still reports 0 -> source->worklet
+      //     hop is broken
+      // Auto-stops after ~20 seconds to bound log volume.
+      try {
+        const codec2Analyser = audioCtx.createAnalyser();
+        codec2Analyser.fftSize = 2048;
+        codec2Analyser.smoothingTimeConstant = 0;
+        source.connect(codec2Analyser);
+
+        let rawSource = null;
+        let rawAnalyser = null;
+        try {
+          rawSource = audioCtx.createMediaStreamSource(localStream);
+          rawAnalyser = audioCtx.createAnalyser();
+          rawAnalyser.fftSize = 2048;
+          rawAnalyser.smoothingTimeConstant = 0;
+          rawSource.connect(rawAnalyser);
+        } catch (rawErr) {
+          log("Capture diag raw localStream tap failed", { message: rawErr.message });
+        }
+
+        const buf = new Float32Array(2048);
+        const computePeak = (analyser) => {
+          if (!analyser) return null;
+          analyser.getFloatTimeDomainData(buf);
+          let peak = 0;
+          for (let i = 0; i < buf.length; i += 1) {
+            const v = buf[i];
+            const a = v < 0 ? -v : v;
+            if (a > peak) peak = a;
+          }
+          return peak;
+        };
+
+        let ticks = 0;
+        const intervalId = setInterval(() => {
+          ticks += 1;
+          const codec2Peak = computePeak(codec2Analyser);
+          const rawPeak = computePeak(rawAnalyser);
+          const origTrack = originalTrack;
+          const cloneTrack = codec2Track;
+          log("Capture diag peaks", {
+            tick: ticks,
+            codec2SourcePeak: codec2Peak !== null ? codec2Peak.toFixed(6) : "n/a",
+            rawLocalStreamPeak: rawPeak !== null ? rawPeak.toFixed(6) : "n/a",
+            ctxState: audioCtx.state,
+            ctxTime: audioCtx.currentTime.toFixed(2),
+            origMuted: origTrack ? origTrack.muted : null,
+            origEnabled: origTrack ? origTrack.enabled : null,
+            origReadyState: origTrack ? origTrack.readyState : null,
+            cloneMuted: cloneTrack ? cloneTrack.muted : null,
+            cloneEnabled: cloneTrack ? cloneTrack.enabled : null,
+            cloneReadyState: cloneTrack ? cloneTrack.readyState : null
+          });
+          if (ticks >= 20) {
+            clearInterval(intervalId);
+            try { source.disconnect(codec2Analyser); } catch (cleanupErr) {}
+            if (rawSource) { try { rawSource.disconnect(); } catch (cleanupErr) {} }
+            log("Capture diag finished (20 ticks)");
+            codec2.captureDiag = null;
+          }
+        }, 1000);
+
+        this.captureDiag = { intervalId, codec2Analyser, rawSource, rawAnalyser };
+        log("Capture diag taps installed");
+      } catch (diagErr) {
+        log("Capture diag setup failed", { message: diagErr.message });
+      }
+      // === END DIAG =================================================
+
       // Keep the encoder reachable from destination so Safari schedules
       // process() on the worklet, but DO NOT route the mic source itself
       // to destination — that creates an AEC-detected loopback that makes
@@ -2453,6 +2533,21 @@ const codec2 = {
         // best-effort cleanup
       }
       this.sourceNode = null;
+    }
+    if (this.captureDiag) {
+      try {
+        clearInterval(this.captureDiag.intervalId);
+      } catch (error) {
+        // best-effort cleanup
+      }
+      if (this.captureDiag.rawSource) {
+        try {
+          this.captureDiag.rawSource.disconnect();
+        } catch (error) {
+          // best-effort cleanup
+        }
+      }
+      this.captureDiag = null;
     }
     if (this.senderTrack && this.senderTrack !== this.originalTrack) {
       try {
