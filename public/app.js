@@ -297,6 +297,28 @@ function buildDeviceSpecificGuidance() {
   return "Use a trusted HTTPS page, then allow Microphone when the browser prompt appears. If you denied it earlier, re-enable it in the browser site settings.";
 }
 
+function describeAudioTrack(track) {
+  if (!track) {
+    return null;
+  }
+
+  let settings = null;
+  try {
+    settings = typeof track.getSettings === "function" ? track.getSettings() : null;
+  } catch {
+    settings = null;
+  }
+
+  return {
+    id: track.id || "",
+    label: track.label || "",
+    enabled: track.enabled,
+    muted: track.muted,
+    readyState: track.readyState,
+    settings
+  };
+}
+
 function getMicBlockedReason(error) {
   switch (error?.name) {
     case "NotAllowedError":
@@ -450,6 +472,11 @@ async function request(path, options = {}) {
 
 async function ensureLocalAudio() {
   if (state.localStream) {
+    if (codec2.useRelayTransport()) {
+      localAudio.srcObject = null;
+    } else {
+      localAudio.srcObject = state.localStream;
+    }
     setMicStatus(
       "ready",
       "Microphone access is active on this device.",
@@ -479,14 +506,21 @@ async function ensureLocalAudio() {
     });
 
     state.localStream = stream;
-    localAudio.srcObject = stream;
+    if (codec2.useRelayTransport()) {
+      localAudio.srcObject = null;
+    } else {
+      localAudio.srcObject = stream;
+    }
     setMicStatus(
       "ready",
       "Microphone access is active on this device.",
       "The browser granted access and the app can now join calls."
     );
     updateControls();
-    log("Local microphone captured");
+    log("Local microphone captured", {
+      relayTransport: codec2.useRelayTransport(),
+      track: describeAudioTrack(stream.getAudioTracks()[0] || null)
+    });
     return stream;
   } catch (error) {
     const guidance = getMicBlockedReason(error);
@@ -1474,6 +1508,9 @@ function toggleMute() {
   for (const track of state.localStream.getAudioTracks()) {
     track.enabled = !state.muted;
   }
+  if (codec2.codec2Track) {
+    codec2.codec2Track.enabled = !state.muted;
+  }
 
   updateControls();
 }
@@ -1539,14 +1576,7 @@ function rescueAudioContext() {
 
 resetRemoteAudio();
 (async () => {
-  const permState = await refreshMicPermissionState().catch(() => "unknown");
-  if (permState === "prompt" || permState === "unknown") {
-    try {
-      await ensureLocalAudio();
-    } catch (error) {
-      log("Early microphone request failed", { message: error.message });
-    }
-  }
+  await refreshMicPermissionState().catch(() => "unknown");
 })();
 updateControls();
 log("Ready");
@@ -1589,6 +1619,9 @@ const codec2 = {
   audioContext: null,
   sender: null,
   originalTrack: null,
+  codec2Track: null,
+  codec2Stream: null,
+  sourceNode: null,
   samplesPerFrame: 0,
   bytesPerFrame: 0,
   frameDurationMs: 20,
@@ -2217,6 +2250,20 @@ const codec2 = {
       });
       await audioCtx.audioWorklet.addModule("/codec2-worker.js");
 
+      const originalTrack = localStream.getAudioTracks()[0] || null;
+      const codec2Track =
+        this.useRelayTransport() && originalTrack ? originalTrack.clone() : originalTrack;
+      const codec2Stream = codec2Track ? new MediaStream([codec2Track]) : localStream;
+      if (codec2Track) {
+        codec2Track.enabled = !state.muted;
+      }
+      log("Codec2 capture graph selected", {
+        relayTransport: this.useRelayTransport(),
+        audioContextSampleRate: audioCtx.sampleRate,
+        originalTrack: describeAudioTrack(originalTrack),
+        codec2Track: describeAudioTrack(codec2Track)
+      });
+
       // iOS Safari quirk: createMediaStreamSource() yields a node that
       // delivers no audio unless the same MediaStream is also being consumed
       // by an HTMLMediaElement that has had .play() called on it. Attach the
@@ -2233,7 +2280,7 @@ const codec2 = {
         keepalive.setAttribute("playsinline", "");
         keepalive.setAttribute("autoplay", "");
         keepalive.style.display = "none";
-        keepalive.srcObject = localStream;
+        keepalive.srcObject = codec2Stream;
         document.body.appendChild(keepalive);
         // play() may reject without a fresh user gesture; that's OK on
         // browsers that don't need this trick — the catch swallows it.
@@ -2257,7 +2304,7 @@ const codec2 = {
         channelCountMode: "explicit",
         channelInterpretation: "speakers"
       });
-      const source = audioCtx.createMediaStreamSource(localStream);
+      const source = audioCtx.createMediaStreamSource(codec2Stream);
       source.connect(encoderNode);
 
       // Keep the encoder reachable from destination so Safari schedules
@@ -2307,7 +2354,10 @@ const codec2 = {
       this.sender = peerConnection
         .getSenders()
         .find((item) => item.track && item.track.kind === "audio") || null;
-      this.originalTrack = localStream.getAudioTracks()[0] || null;
+      this.originalTrack = originalTrack;
+      this.codec2Track = codec2Track;
+      this.codec2Stream = codec2Stream;
+      this.sourceNode = source;
       // Under relay transport (codec2 + FARGAN), force codec2 always-on instead of
       // only activating it under the "extreme" network profile.
       this.desiredActive = this.useRelayTransport() || state.audioProfile === "extreme";
@@ -2383,6 +2433,21 @@ const codec2 = {
       }
       this.iosKeepalivePlayer = null;
     }
+    if (this.sourceNode) {
+      try {
+        this.sourceNode.disconnect();
+      } catch (error) {
+        // best-effort cleanup
+      }
+      this.sourceNode = null;
+    }
+    if (this.codec2Track && this.codec2Track !== this.originalTrack) {
+      try {
+        this.codec2Track.stop();
+      } catch (error) {
+        // best-effort cleanup
+      }
+    }
     this.encoderNode = null;
     this.decoderNode = null;
     this.dataChannel = null;
@@ -2391,6 +2456,8 @@ const codec2 = {
     }
     this.sender = null;
     this.originalTrack = null;
+    this.codec2Track = null;
+    this.codec2Stream = null;
     this.packetizer = null;
     this.headerCompressor = null;
     this.headerDecompressor = null;
