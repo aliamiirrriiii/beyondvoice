@@ -777,28 +777,44 @@ function updateControls() {
   updatePeerDisplay();
 }
 
-async function unlockSpeaker() {
-  // A tap on Speaker is a declaration of intent — record it immediately so
-  // the UI reflects the request even before any peer audio is flowing.
-  // iOS Safari is much more reliable when all remote tracks stay attached
-  // to this single pre-existing <audio> element instead of late-created
-  // per-peer elements outside the original gesture chain.
-  state.speakerUnlocked = true;
-  updateControls();
-
-  ensureRemotePlaybackStream();
-  if (remoteAudio) {
-    try {
-      const result = remoteAudio.play();
-      if (result && typeof result.catch === "function") {
-        await result.catch(() => null);
-      }
-    } catch {
-      // best-effort: a later user gesture can retry
-    }
+async function unlockSpeaker({ userGesture = false } = {}) {
+  // Only a real user gesture should mark the speaker as "ready" before audio
+  // is actually flowing. Async ontrack handlers may attempt playback, but on
+  // iOS Safari those late autoplay attempts can still be rejected.
+  if (userGesture) {
+    state.speakerUnlocked = true;
+    updateControls();
   }
 
-  log("Speaker enabled");
+  ensureRemotePlaybackStream();
+  if (!remoteAudio) {
+    if (!userGesture) {
+      state.speakerUnlocked = false;
+      updateControls();
+    }
+    return false;
+  }
+
+  try {
+    const result = remoteAudio.play();
+    if (result && typeof result.catch === "function") {
+      await result;
+    }
+    state.speakerUnlocked = !remoteAudio.paused;
+    updateControls();
+    if (userGesture) {
+      log("Speaker enabled");
+    }
+    return state.speakerUnlocked;
+  } catch (error) {
+    if (!userGesture) {
+      state.speakerUnlocked = false;
+      updateControls();
+      return false;
+    }
+    log("Speaker unlock needs a user tap", { message: error.message });
+    return false;
+  }
 }
 
 function setMicStatus(kind, summary, details) {
@@ -1570,12 +1586,10 @@ async function createPeerConnection(peerId, { replace = false } = {}) {
       return;
     }
 
-    const candidate = event.candidate;
-    if (candidate.candidate.includes(".local") || candidate.candidate.includes(" host ")) {
-      return;
-    }
-
-    context.candidateBatch.push(candidate);
+    // Do not drop host or mDNS ICE candidates. They are often the only viable
+    // path for same-LAN, same-device, or NAT-unfriendly call setups, and
+    // filtering them can leave the UI "connected" while no media ever flows.
+    context.candidateBatch.push(event.candidate);
     if (!context.candidateFlushTimerId) {
       context.candidateFlushTimerId = window.setTimeout(flushCandidates, 200);
     }
@@ -1612,7 +1626,7 @@ async function createPeerConnection(peerId, { replace = false } = {}) {
       };
     }
 
-    unlockSpeaker().catch((error) => {
+    unlockSpeaker({ userGesture: false }).catch((error) => {
       log("Remote audio playback may need a tap", { message: error.message });
     });
     updateStatusFromPeerConnections();
@@ -2292,7 +2306,7 @@ if (muteButton) {
 }
 if (speakerButton) {
   speakerButton.addEventListener("click", () => {
-    unlockSpeaker().catch((error) => {
+    unlockSpeaker({ userGesture: true }).catch((error) => {
       log("Speaker unlock failed", { message: error.message });
     });
   });

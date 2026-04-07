@@ -237,6 +237,24 @@ async function run() {
           message.signal?.type === "offer"
       );
 
+      const missingTargetErrorPromise = waitForSocketMessage(
+        aliceSocket.ws,
+        (message) => message?.type === "error" && message.error === "Signal target not found"
+      );
+      aliceSocket.ws.send(JSON.stringify({
+        type: "signal",
+        signalType: "offer",
+        targetId: "peer-missing",
+        payload: {
+          description: {
+            type: "offer",
+            sdp: "v=0\r\n"
+          }
+        }
+      }));
+      const missingTargetError = await missingTargetErrorPromise;
+      assert.equal(missingTargetError.error, "Signal target not found");
+
       const alicePeerLeftPromise = waitForSocketMessage(
         aliceSocket.ws,
         (message) => message?.type === "peer-left" && message.peer?.id === bob.participant.id

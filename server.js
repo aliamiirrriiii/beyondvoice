@@ -1347,10 +1347,13 @@ async function main() {
               console.log("[SIGNAL]", message.signalType, "sdp_lines=" + lines.length, "blanks_mid_body=" + blanks.length);
               console.log("[SDP-DUMP-" + message.signalType.toUpperCase() + "-BEGIN]\n" + sdpStr + "\n[SDP-DUMP-END]");
             }
-            await store.publishSignal(ws.roomId, ws.participantId, message.targetId, {
+            const ok = await store.publishSignal(ws.roomId, ws.participantId, message.targetId, {
               type: message.signalType,
               payload: message.payload || {}
             });
+            if (!ok) {
+              sendSocketMessage(ws, { type: "error", error: "Signal target not found" });
+            }
             break;
           case "leave":
             if (ws.roomId && ws.participantId) {
