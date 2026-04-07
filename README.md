@@ -4,6 +4,8 @@ Two-person browser voice calling with:
 
 - WebRTC audio transport
 - aggressive Opus compression tuning
+- optional Codec2 extreme mode with compact RTP packetization, header compression, adaptive jitter buffering, and PLC hooks
+- server-side relay media path for Codec2 extreme mode over `/media` WebSocket
 - WebSocket signaling and static serving
 - Redis-backed shared room state
 - coturn relay service with ephemeral credentials
@@ -161,6 +163,8 @@ Application runtime:
 - `TURN_USERNAME`
 - `TURN_CREDENTIAL`
 - `ALLOWED_ORIGIN`
+- `NEURAL_RELAY_MODE`
+- `NEURAL_RELAY_BACKEND`
 
 Operational tuning:
 
@@ -205,3 +209,64 @@ The service is deployable now, but these are still the next high-value improveme
 3. add metrics/log aggregation and alerting
 4. add TLS-enabled `turns:` on `5349` if your target networks require it
 5. use managed or geographically distributed TURN infrastructure if you need global reach
+
+## Extreme mode roadmap status
+
+The repository now includes an internal "extreme transport" path for the optional Codec2 data-channel mode:
+
+- RTP-like packet sequencing and timestamps for Codec2 frames
+- compact ROHC-style header compression for the packet headers
+- adaptive jitter buffering driven by live WebRTC network metrics
+- packet-loss concealment hooks that can replay or synthesize short fallback frames
+- a neural vocoder adapter boundary for swapping the plain Codec2 decoder with LPCNet or another model later
+- a server-side relay path that accepts compact Codec2 frames over `/media`, reorders them, applies PLC centrally, and forwards repaired frames to the recipient
+
+This is intentionally a migration layer, not a claim of full standards-compliant ROHC or a shipped LPCNet integration inside the browser today.
+
+What is still required for the full target stack described in the roadmap:
+
+1. replace the passthrough `NeuralVocoderAdapter` with a real LPCNet/LSPNet runtime
+2. optionally export native Codec2 parameters such as LSPs/pitch directly from the codec build instead of deriving neural features from relay-side decoded PCM
+3. move the transport to a native/mobile UDP path if you want real ROHC over IP/UDP/RTP instead of the current browser/WebSocket approximation
+
+## Relay architecture
+
+The new relay path is built for the browser-first version of this project:
+
+1. the sender browser encodes mic audio into Codec2 frames
+2. the browser packetizes and compresses those frames, then sends them to `/media`
+3. `server.js` authenticates the media socket and hands frames to [media-relay.js](/Users/aliamiri/Documents/Programming/voiceai/media-relay.js)
+4. the relay performs server-side jitter buffering and PLC
+5. in `NEURAL_RELAY_MODE=fargan`, the relay decodes Codec2 natively, synthesizes 8 kHz PCM with FARGAN/LPCNet state, and forwards PCM frames to the recipient browser for direct playback
+6. in other modes, repaired frames are forwarded to the recipient browser, which decodes them for playback
+
+This keeps the heaviest transport repair logic off the recipient device without rewriting the whole product into a native mobile stack yet.
+
+## Neural relay modes
+
+The relay now exposes a pluggable neural-processing stage behind a stable interface:
+
+- `NEURAL_RELAY_MODE=off`
+  Plain relay pass-through. Jitter buffering and transport repair stay enabled.
+- `NEURAL_RELAY_MODE=deep-plc`
+  Relay-side concealment shaping path intended for a future Opus Deep PLC bridge.
+- `NEURAL_RELAY_MODE=fargan`
+  Relay-side native FARGAN synthesis path. The relay decodes incoming Codec2 700C packets, computes LPCNet features from the decoded speech, synthesizes PCM with FARGAN, and uses LPCNet PLC for concealed frames before sending PCM payloads back to the browser.
+
+Backends:
+
+- `NEURAL_RELAY_BACKEND=in-process`
+  Runs the JS fallback engine inside the Node process.
+- `NEURAL_RELAY_BACKEND=child-process`
+  Runs the JS fallback engine in a dedicated worker process.
+- `NEURAL_RELAY_BACKEND=native-exec`
+  Runs the stable relay wrapper at `native/fargan-relay/bin/fargan-relay-worker`. That wrapper prefers a compiled `fargan-relay-worker-native` binary when present and falls back to the repo-local JS stdio worker otherwise. If the wrapper itself is missing, the server falls back to `in-process`.
+
+Build helpers:
+
+- `npm run build:neural-relay`
+  Prepares the wrapper and JS stdio fallback path.
+- `npm run build:neural-relay:native`
+  Builds pinned vendored `libopus.a` and `libcodec2.a`, then compiles the native relay executable used by the wrapper.
+
+The native worker is linked against vendored Opus 1.5.2 and Codec2 1.2.0. In `fargan` mode it returns synthesized PCM payloads after a short bootstrap window, and concealed frames are generated through LPCNet PLC rather than replaying the original Codec2 packet.

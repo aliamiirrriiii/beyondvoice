@@ -11,7 +11,11 @@ COPY package-lock.json ./package-lock.json
 RUN npm ci --omit=dev
 
 COPY server.js ./server.js
+COPY media-relay.js ./media-relay.js
+COPY neural-relay.js ./neural-relay.js
 COPY public ./public
+COPY native ./native
+COPY vendor ./vendor
 
 USER node
 

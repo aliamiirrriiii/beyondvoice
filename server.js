@@ -7,6 +7,8 @@ const zlib = require("zlib");
 const { URL } = require("url");
 const { WebSocketServer } = require("ws");
 const { createClient } = require("redis");
+const { MediaRelayController } = require("./media-relay");
+const { createNeuralRelay } = require("./neural-relay");
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || "0.0.0.0";
@@ -31,11 +33,17 @@ const TURN_USERNAME = process.env.TURN_USERNAME || "";
 const TURN_CREDENTIAL = process.env.TURN_CREDENTIAL || "";
 const AUTH_USERNAME = process.env.AUTH_USERNAME || "";
 const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "";
+const NEURAL_RELAY_MODE = String(process.env.NEURAL_RELAY_MODE || "off").trim().toLowerCase();
+const NEURAL_RELAY_BACKEND = String(process.env.NEURAL_RELAY_BACKEND || "in-process")
+  .trim()
+  .toLowerCase();
 
 let isShuttingDown = false;
 const rateLimits = new Map();
 const socketsByParticipant = new Map();
 const participantsByRoom = new Map();
+const mediaSocketsByParticipant = new Map();
+const mediaParticipantsByRoom = new Map();
 
 function now() {
   return Date.now();
@@ -334,7 +342,7 @@ function buildIceServersForParticipant(participantId) {
   });
 }
 
-function appConfigScript() {
+function appConfigScript({ neuralRelayMode = "off", neuralRelayBackend = "disabled" } = {}) {
   const codec2Available =
     fs.existsSync(path.join(PUBLIC_DIR, "codec2.wasm")) &&
     fs.existsSync(path.join(PUBLIC_DIR, "codec2-worker.js"));
@@ -345,7 +353,11 @@ function appConfigScript() {
     }),
     maxReconnectDelayMs: 5000,
     wsPath: "/ws",
-    enableCodec2: codec2Available
+    mediaWsPath: "/media",
+    enableCodec2: codec2Available,
+    enableMediaRelay: codec2Available,
+    neuralRelayMode: codec2Available ? neuralRelayMode : "off",
+    neuralRelayBackend: codec2Available ? neuralRelayBackend : "disabled"
   };
 
   return `window.APP_CONFIG = ${JSON.stringify(config, null, 2)};`;
@@ -496,7 +508,8 @@ function createMemoryStore(publishEvent) {
         return null;
       }
 
-      const participant = room.participants.get(participantId);
+      const normalizedParticipantId = String(participantId || "").trim();
+      const participant = room.participants.get(normalizedParticipantId);
       if (!participant) {
         return null;
       }
@@ -518,22 +531,24 @@ function createMemoryStore(publishEvent) {
     },
     async hasParticipant(roomId, participantId) {
       const room = getRoom(roomId);
-      return Boolean(room && room.participants.has(participantId));
+      return Boolean(room && room.participants.has(String(participantId || "").trim()));
     },
     async publishSignal(roomId, fromId, targetId, signal) {
       const room = getRoom(roomId);
-      if (!room || !room.participants.has(fromId)) {
+      const normalizedFromId = String(fromId || "").trim();
+      const normalizedTargetId = String(targetId || "").trim();
+      if (!room || !room.participants.has(normalizedFromId)) {
         return false;
       }
 
-      if (targetId && !room.participants.has(targetId)) {
+      if (normalizedTargetId && !room.participants.has(normalizedTargetId)) {
         return false;
       }
 
       await publishEvent(room.id, {
         type: "signal",
-        from: fromId,
-        targetId: targetId || "",
+        from: normalizedFromId,
+        targetId: normalizedTargetId || "",
         signal
       });
       return true;
@@ -544,12 +559,13 @@ function createMemoryStore(publishEvent) {
         return null;
       }
 
-      const participant = room.participants.get(participantId);
+      const normalizedParticipantId = String(participantId || "").trim();
+      const participant = room.participants.get(normalizedParticipantId);
       if (!participant) {
         return null;
       }
 
-      room.participants.delete(participantId);
+      room.participants.delete(normalizedParticipantId);
       room.updatedAt = now();
 
       await publishEvent(room.id, {
@@ -648,7 +664,8 @@ function createRedisStore(commandClient, publishEvent) {
       };
     },
     async touchParticipant(roomId, participantId) {
-      const value = await commandClient.hGet(roomParticipantsKey(roomId), participantId);
+      const normalizedParticipantId = String(participantId || "").trim();
+      const value = await commandClient.hGet(roomParticipantsKey(roomId), normalizedParticipantId);
       if (!value) {
         return null;
       }
@@ -670,16 +687,26 @@ function createRedisStore(commandClient, publishEvent) {
         .map(participantSnapshot);
     },
     async hasParticipant(roomId, participantId) {
-      return (await commandClient.hExists(roomParticipantsKey(roomId), participantId)) === 1;
+      return (
+        await commandClient.hExists(
+          roomParticipantsKey(roomId),
+          String(participantId || "").trim()
+        )
+      ) === 1;
     },
     async publishSignal(roomId, fromId, targetId, signal) {
-      const senderExists = await commandClient.hExists(roomParticipantsKey(roomId), fromId);
+      const normalizedFromId = String(fromId || "").trim();
+      const normalizedTargetId = String(targetId || "").trim();
+      const senderExists = await commandClient.hExists(roomParticipantsKey(roomId), normalizedFromId);
       if (senderExists !== 1) {
         return false;
       }
 
-      if (targetId) {
-        const targetExists = await commandClient.hExists(roomParticipantsKey(roomId), targetId);
+      if (normalizedTargetId) {
+        const targetExists = await commandClient.hExists(
+          roomParticipantsKey(roomId),
+          normalizedTargetId
+        );
         if (targetExists !== 1) {
           return false;
         }
@@ -687,14 +714,15 @@ function createRedisStore(commandClient, publishEvent) {
 
       await publishEvent(roomId, {
         type: "signal",
-        from: fromId,
-        targetId: targetId || "",
+        from: normalizedFromId,
+        targetId: normalizedTargetId || "",
         signal
       });
       return true;
     },
     async removeParticipant(roomId, participantId, reason = "left") {
-      const value = await commandClient.hGet(roomParticipantsKey(roomId), participantId);
+      const normalizedParticipantId = String(participantId || "").trim();
+      const value = await commandClient.hGet(roomParticipantsKey(roomId), normalizedParticipantId);
       if (!value) {
         return null;
       }
@@ -704,7 +732,7 @@ function createRedisStore(commandClient, publishEvent) {
         return null;
       }
 
-      await commandClient.hDel(roomParticipantsKey(roomId), participantId);
+      await commandClient.hDel(roomParticipantsKey(roomId), normalizedParticipantId);
       await publishEvent(roomId, {
         type: "peer-left",
         peer: participantSnapshot(participant),
@@ -736,6 +764,14 @@ function sendSocketMessage(ws, payload) {
     return;
   }
   ws.send(JSON.stringify(payload));
+}
+
+function sendBinarySocketMessage(ws, payload) {
+  if (!ws || ws.readyState !== ws.OPEN) {
+    return;
+  }
+
+  ws.send(payload, { binary: true });
 }
 
 function registerSocket(ws, roomId, participantId) {
@@ -771,8 +807,50 @@ function unregisterSocket(ws) {
   ws.roomId = "";
 }
 
+function registerMediaSocket(ws, roomId, participantId) {
+  unregisterMediaSocket(ws);
+
+  ws.roomId = roomId;
+  ws.participantId = participantId;
+  mediaSocketsByParticipant.set(participantId, ws);
+
+  const roomSet = mediaParticipantsByRoom.get(roomId) || new Set();
+  roomSet.add(participantId);
+  mediaParticipantsByRoom.set(roomId, roomSet);
+}
+
+function unregisterMediaSocket(ws) {
+  if (!ws || !ws.participantId || !ws.roomId) {
+    return;
+  }
+
+  if (mediaSocketsByParticipant.get(ws.participantId) === ws) {
+    mediaSocketsByParticipant.delete(ws.participantId);
+  }
+
+  const roomSet = mediaParticipantsByRoom.get(ws.roomId);
+  if (roomSet) {
+    roomSet.delete(ws.participantId);
+    if (roomSet.size === 0) {
+      mediaParticipantsByRoom.delete(ws.roomId);
+    }
+  }
+
+  ws.participantId = "";
+  ws.roomId = "";
+}
+
 function routeEventLocally(roomId, event) {
   const roomSet = participantsByRoom.get(roomId);
+
+  if (event.type === "peer-left" && event.peer?.id) {
+    const mediaSocket = mediaSocketsByParticipant.get(event.peer.id);
+    if (mediaSocket) {
+      unregisterMediaSocket(mediaSocket);
+      mediaSocket.close(4000, "Peer left");
+    }
+  }
+
   if (!roomSet || roomSet.size === 0) {
     return;
   }
@@ -800,13 +878,24 @@ function routeEventLocally(roomId, event) {
   }
 }
 
+function routeMediaLocally(targetId, payload) {
+  if (!targetId) {
+    return;
+  }
+
+  sendBinarySocketMessage(mediaSocketsByParticipant.get(targetId), payload);
+}
+
 async function createStore() {
   if (!REDIS_URL) {
     return {
       store: createMemoryStore(async (roomId, event) => {
         routeEventLocally(roomId, event);
       }),
-      redisClients: null
+      redisClients: null,
+      relayMediaFrame: async (targetId, payload) => {
+        routeMediaLocally(targetId, payload);
+      }
     };
   }
 
@@ -819,12 +908,21 @@ async function createStore() {
   await subscriberClient.connect();
 
   const channel = `${REDIS_PREFIX}:events`;
+  const mediaChannel = `${REDIS_PREFIX}:media`;
   await subscriberClient.subscribe(channel, (rawMessage) => {
     try {
       const envelope = JSON.parse(rawMessage);
       routeEventLocally(envelope.roomId, envelope.event);
     } catch (error) {
       console.error("Failed to route pubsub event", error);
+    }
+  });
+  await subscriberClient.subscribe(mediaChannel, (rawMessage) => {
+    try {
+      const envelope = JSON.parse(rawMessage);
+      routeMediaLocally(envelope.targetId, Buffer.from(envelope.data, "base64"));
+    } catch (error) {
+      console.error("Failed to route media event", error);
     }
   });
 
@@ -838,13 +936,46 @@ async function createStore() {
       commandClient,
       publisherClient,
       subscriberClient
+    },
+    relayMediaFrame: async (targetId, payload) => {
+      await publisherClient.publish(mediaChannel, JSON.stringify({
+        targetId,
+        data: Buffer.from(payload).toString("base64")
+      }));
     }
   };
 }
 
 async function main() {
-  const { store, redisClients } = await createStore();
-  const cachedAppConfig = appConfigScript();
+  const { store, redisClients, relayMediaFrame } = await createStore();
+  const neuralRelay = createNeuralRelay({
+    mode: NEURAL_RELAY_MODE,
+    backend: NEURAL_RELAY_BACKEND
+  });
+  const cachedAppConfig = appConfigScript({
+    neuralRelayMode: neuralRelay.mode,
+    neuralRelayBackend: neuralRelay.backend
+  });
+  const mediaRelay = new MediaRelayController({
+    neuralRelay,
+    frameDurationMs: 40,
+    frameSamples: 320,
+    listTargets: (roomId, senderId) => {
+      const roomSet = mediaParticipantsByRoom.get(roomId);
+      if (!roomSet) {
+        return [];
+      }
+
+      return Array.from(roomSet)
+        .filter((participantId) => participantId !== senderId)
+        .filter((participantId) => mediaSocketsByParticipant.has(participantId));
+    },
+    deliverFrame: (targetId, bytes) => {
+      relayMediaFrame(targetId, bytes).catch((error) => {
+        console.error("Failed to relay media frame", error);
+      });
+    }
+  });
 
   async function handleJoin(request, response, roomId) {
     const body = await readJsonBody(request);
@@ -897,6 +1028,12 @@ async function main() {
   async function handleLeave(request, response, roomId) {
     const body = await readJsonBody(request);
     await store.removeParticipant(roomId, body.participantId, "left");
+    mediaRelay.removeParticipant(roomId, body.participantId);
+    const mediaSocket = mediaSocketsByParticipant.get(body.participantId);
+    if (mediaSocket) {
+      unregisterMediaSocket(mediaSocket);
+      mediaSocket.close(4000, "Peer left");
+    }
     json(response, 200, { ok: true });
   }
 
@@ -910,7 +1047,9 @@ async function main() {
             ok: true,
             now: new Date().toISOString(),
             rooms: roomsCount,
-            signaling: store.mode
+            signaling: store.mode,
+            neuralRelayMode: neuralRelay.mode,
+            neuralRelayBackend: neuralRelay.backend
           });
         })
         .catch((error) => {
@@ -923,7 +1062,9 @@ async function main() {
       json(response, isShuttingDown ? 503 : 200, {
         ok: !isShuttingDown,
         shuttingDown: isShuttingDown,
-        signaling: store.mode
+        signaling: store.mode,
+        neuralRelayMode: neuralRelay.mode,
+        neuralRelayBackend: neuralRelay.backend
       });
       return true;
     }
@@ -1040,6 +1181,10 @@ async function main() {
       threshold: 128
     }
   });
+  const mediaWss = new WebSocketServer({
+    noServer: true,
+    perMessageDeflate: false
+  });
 
   async function authenticateSocket(ws, message) {
     const roomId = normalizeRoomId(message.roomId);
@@ -1065,6 +1210,31 @@ async function main() {
       roomId,
       participant: participantSnapshot(participant),
       peers
+    });
+  }
+
+  async function authenticateMediaSocket(ws, message) {
+    const roomId = normalizeRoomId(message.roomId);
+    const participantId = String(message.participantId || "").trim();
+
+    if (!roomId || !participantId) {
+      sendSocketMessage(ws, { type: "error", error: "Missing room or participant id" });
+      ws.close(4001, "Missing auth");
+      return;
+    }
+
+    const participant = await store.touchParticipant(roomId, participantId);
+    if (!participant) {
+      sendSocketMessage(ws, { type: "error", error: "Participant not found" });
+      ws.close(4004, "Participant not found");
+      return;
+    }
+
+    registerMediaSocket(ws, roomId, participantId);
+    sendSocketMessage(ws, {
+      type: "media-ready",
+      roomId,
+      participant: participantSnapshot(participant)
     });
   }
 
@@ -1137,6 +1307,79 @@ async function main() {
     });
   });
 
+  mediaWss.on("connection", (ws) => {
+    ws.isAlive = true;
+    ws.participantId = "";
+    ws.roomId = "";
+
+    ws.on("pong", () => {
+      ws.isAlive = true;
+    });
+
+    ws.on("message", async (rawMessage, isBinary) => {
+      if (isBinary) {
+        if (!ws.roomId || !ws.participantId) {
+          sendSocketMessage(ws, { type: "error", error: "Media socket is not authenticated" });
+          return;
+        }
+
+        try {
+          await store.touchParticipant(ws.roomId, ws.participantId);
+          mediaRelay.receiveCompressedFrame(ws.roomId, ws.participantId, new Uint8Array(rawMessage));
+        } catch (error) {
+          sendSocketMessage(ws, { type: "error", error: error.message });
+        }
+        return;
+      }
+
+      const raw = rawMessage.toString("utf-8");
+      if (raw === "h") {
+        if (ws.roomId && ws.participantId) {
+          await store.touchParticipant(ws.roomId, ws.participantId);
+        }
+        return;
+      }
+
+      let message;
+      try {
+        message = JSON.parse(raw);
+      } catch {
+        sendSocketMessage(ws, { type: "error", error: "Invalid JSON message" });
+        return;
+      }
+
+      try {
+        switch (message.type) {
+          case "auth":
+            await authenticateMediaSocket(ws, message);
+            break;
+          case "heartbeat":
+            if (ws.roomId && ws.participantId) {
+              await store.touchParticipant(ws.roomId, ws.participantId);
+            }
+            break;
+          case "leave":
+            if (ws.roomId && ws.participantId) {
+              mediaRelay.removeParticipant(ws.roomId, ws.participantId);
+            }
+            unregisterMediaSocket(ws);
+            break;
+          default:
+            sendSocketMessage(ws, { type: "error", error: "Unknown message type" });
+        }
+      } catch (error) {
+        sendSocketMessage(ws, { type: "error", error: error.message });
+      }
+    });
+
+    ws.on("close", () => {
+      if (ws.roomId && ws.participantId) {
+        mediaRelay.removeParticipant(ws.roomId, ws.participantId);
+      }
+      unregisterMediaSocket(ws);
+    });
+  });
+
   server.on("upgrade", (request, socket, head) => {
     if (isShuttingDown) {
       socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
@@ -1159,7 +1402,7 @@ async function main() {
     }
 
     const url = new URL(request.url, `http://${request.headers.host || "localhost"}`);
-    if (url.pathname !== "/ws") {
+    if (url.pathname !== "/ws" && url.pathname !== "/media") {
       socket.write("HTTP/1.1 404 Not Found\r\n\r\n");
       socket.destroy();
       return;
@@ -1171,8 +1414,15 @@ async function main() {
       return;
     }
 
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit("connection", ws, request);
+    if (url.pathname === "/ws") {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit("connection", ws, request);
+      });
+      return;
+    }
+
+    mediaWss.handleUpgrade(request, socket, head, (ws) => {
+      mediaWss.emit("connection", ws, request);
     });
   });
 
@@ -1189,6 +1439,17 @@ async function main() {
       if (!ws.isAlive) {
         ws.terminate();
         unregisterSocket(ws);
+        continue;
+      }
+
+      ws.isAlive = false;
+      ws.ping();
+    }
+
+    for (const ws of mediaWss.clients) {
+      if (!ws.isAlive) {
+        ws.terminate();
+        unregisterMediaSocket(ws);
         continue;
       }
 
@@ -1215,6 +1476,10 @@ async function main() {
       sendSocketMessage(ws, { type: "server-shutdown" });
       ws.close(1012, "Server shutting down");
     }
+    for (const ws of mediaWss.clients) {
+      sendSocketMessage(ws, { type: "server-shutdown" });
+      ws.close(1012, "Server shutting down");
+    }
 
     const forceExitTimer = setTimeout(() => {
       console.error("Forced shutdown after grace period");
@@ -1234,6 +1499,7 @@ async function main() {
           redisClients.commandClient.quit()
         ]);
       }
+      await Promise.resolve(mediaRelay.close());
 
       if (error) {
         console.error("Shutdown error", error);

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+NATIVE_BIN="$SCRIPT_DIR/fargan-relay-worker-native"
+STDIO_WORKER="$SCRIPT_DIR/../stdio-worker.js"
+
+if [[ -x "$NATIVE_BIN" ]]; then
+  exec "$NATIVE_BIN"
+fi
+
+exec node "$STDIO_WORKER"

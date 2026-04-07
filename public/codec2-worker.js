@@ -15,6 +15,89 @@
 const CODEC2_MODE = 8;
 const CODEC2_SAMPLE_RATE = 8000;
 
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function estimatePitchHz(frame, sampleRate) {
+  if (!frame || frame.length < 32) {
+    return 0;
+  }
+
+  const minLag = Math.max(8, Math.floor(sampleRate / 320));
+  const maxLag = Math.min(frame.length - 1, Math.floor(sampleRate / 60));
+  let bestLag = 0;
+  let bestCorrelation = 0;
+
+  for (let lag = minLag; lag <= maxLag; lag += 1) {
+    let correlation = 0;
+    let energy = 0;
+
+    for (let index = 0; index < frame.length - lag; index += 1) {
+      correlation += frame[index] * frame[index + lag];
+      energy += Math.abs(frame[index]) + Math.abs(frame[index + lag]);
+    }
+
+    if (!energy) {
+      continue;
+    }
+
+    const normalized = correlation / energy;
+    if (normalized > bestCorrelation) {
+      bestCorrelation = normalized;
+      bestLag = lag;
+    }
+  }
+
+  if (!bestLag || bestCorrelation < 0.015) {
+    return 0;
+  }
+
+  return sampleRate / bestLag;
+}
+
+function extractFrameFeatures(frame) {
+  let sumSquares = 0;
+  let zeroCrossings = 0;
+  let lowBandEnergy = 0;
+  let highBandEnergy = 0;
+
+  for (let index = 0; index < frame.length; index += 1) {
+    const sample = frame[index] || 0;
+    sumSquares += sample * sample;
+
+    if (index > 0) {
+      const previous = frame[index - 1] || 0;
+      if ((previous >= 0 && sample < 0) || (previous < 0 && sample >= 0)) {
+        zeroCrossings += 1;
+      }
+
+      const delta = sample - previous;
+      highBandEnergy += Math.abs(delta);
+      lowBandEnergy += Math.abs(sample + previous) * 0.5;
+    }
+  }
+
+  const rms = Math.sqrt(sumSquares / Math.max(frame.length, 1));
+  const pitchHz = estimatePitchHz(frame, CODEC2_SAMPLE_RATE);
+  const zeroCrossingRate = zeroCrossings / Math.max(frame.length - 1, 1);
+  const voicedProbability = pitchHz
+    ? clamp(0.75 - (zeroCrossingRate * 2.2) + (rms * 1.5), 0, 1)
+    : clamp(0.2 + (rms * 1.2) - (zeroCrossingRate * 2.5), 0, 1);
+  const spectralTilt = clamp(
+    (lowBandEnergy - highBandEnergy) / Math.max(lowBandEnergy + highBandEnergy, 1e-6),
+    -1,
+    1
+  );
+
+  return {
+    energy: clamp(rms * 4, 0, 1),
+    pitchHz: clamp(pitchHz, 0, 400),
+    voicedProbability,
+    spectralTilt
+  };
+}
+
 function instantiateCodec2Module(wasmModule) {
   const wasi = {
     fd_close() {
@@ -113,6 +196,7 @@ class Codec2Encoder extends AudioWorkletProcessor {
 
   _encodeFrame(float32Frame) {
     const { exports, memory, codec2Ptr, inPtr, outPtr } = this.encoder;
+    const features = extractFrameFeatures(float32Frame);
 
     // Convert float32 [-1,1] to int16
     const int16View = new Int16Array(memory.buffer, inPtr, this.frameSamples);
@@ -123,7 +207,7 @@ class Codec2Encoder extends AudioWorkletProcessor {
     exports.codec2_encode(codec2Ptr, outPtr, inPtr);
 
     const encoded = new Uint8Array(memory.buffer, outPtr, this.frameBytes).slice();
-    this.port.postMessage({ type: "encoded", data: encoded }, [encoded.buffer]);
+    this.port.postMessage({ type: "encoded", data: encoded, features }, [encoded.buffer]);
   }
 }
 
@@ -146,7 +230,11 @@ class Codec2Decoder extends AudioWorkletProcessor {
         this.port.postMessage({ type: "error", error: err.message });
       });
     } else if (msg.type === "decode" && msg.data) {
-      this._decodeFrame(new Uint8Array(msg.data));
+      this._decodeFrame(new Uint8Array(msg.data), {
+        gain: typeof msg.gain === "number" ? msg.gain : 1
+      });
+    } else if (msg.type === "inject-pcm" && msg.data) {
+      this._injectPcm(new Float32Array(msg.data), typeof msg.gain === "number" ? msg.gain : 1);
     }
   }
 
@@ -170,7 +258,7 @@ class Codec2Decoder extends AudioWorkletProcessor {
     });
   }
 
-  _decodeFrame(encoded) {
+  _decodeFrame(encoded, { gain = 1 } = {}) {
     if (!this.ready || encoded.length < this.frameBytes) return;
 
     const { exports, memory, codec2Ptr, inPtr, outPtr } = this.decoder;
@@ -181,10 +269,22 @@ class Codec2Decoder extends AudioWorkletProcessor {
     const int16View = new Int16Array(memory.buffer, outPtr, this.frameSamples);
     const float32 = new Float32Array(this.frameSamples);
     for (let i = 0; i < this.frameSamples; i++) {
-      float32[i] = int16View[i] / 32768;
+      float32[i] = (int16View[i] / 32768) * gain;
     }
 
     this.pcmQueue.push(float32);
+  }
+
+  _injectPcm(frame, gain = 1) {
+    if (!frame?.length) {
+      return;
+    }
+
+    const pcm = new Float32Array(frame.length);
+    for (let index = 0; index < frame.length; index += 1) {
+      pcm[index] = (frame[index] || 0) * gain;
+    }
+    this.pcmQueue.push(pcm);
   }
 
   process(inputs, outputs) {

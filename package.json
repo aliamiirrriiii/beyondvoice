@@ -9,7 +9,10 @@
   },
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "build:neural-relay": "./scripts/build-neural-relay.sh",
+    "build:neural-relay:native": "./scripts/build-neural-relay.sh --mode native-opus",
+    "test": "node tests/extreme-stack.test.js && node tests/neural-relay.test.js && node tests/media-relay.test.js && ./scripts/build-neural-relay.sh --mode native-opus && node tests/media-relay.e2e.test.js"
   },
   "engines": {
     "node": ">=18"

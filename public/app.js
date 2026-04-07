@@ -37,7 +37,13 @@ const rttText = document.querySelector("#rtt-text");
 const jitterText = document.querySelector("#jitter-text");
 const lossText = document.querySelector("#loss-text");
 const bitrateText = document.querySelector("#bitrate-text");
+const transportModeText = document.querySelector("#transport-mode-text");
+const headerText = document.querySelector("#header-text");
+const bufferText = document.querySelector("#buffer-text");
+const plcText = document.querySelector("#plc-text");
+const vocoderText = document.querySelector("#vocoder-text");
 const logOutput = document.querySelector("#log-output");
+const ExtremeStack = window.ExtremeStack || null;
 
 const state = {
   roomId: "",
@@ -448,6 +454,12 @@ function buildWebSocketUrl() {
   return `${protocol}//${window.location.host}${wsPath}`;
 }
 
+function buildMediaWebSocketUrl() {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const wsPath = window.APP_CONFIG?.mediaWsPath || "/media";
+  return `${protocol}//${window.location.host}${wsPath}`;
+}
+
 function closeSignalingSocket() {
   if (state.signalingSocket) {
     state.signalingSocket.onopen = null;
@@ -517,6 +529,21 @@ function resetStatsDisplay() {
   }
   if (bitrateText) {
     bitrateText.textContent = "-";
+  }
+  if (transportModeText) {
+    transportModeText.textContent = "-";
+  }
+  if (headerText) {
+    headerText.textContent = "-";
+  }
+  if (bufferText) {
+    bufferText.textContent = "-";
+  }
+  if (plcText) {
+    plcText.textContent = "-";
+  }
+  if (vocoderText) {
+    vocoderText.textContent = "-";
   }
 }
 
@@ -1254,6 +1281,11 @@ function startStatsLoop() {
             ? availableOutgoingBitrate / 1000
             : null
       });
+      codec2.updateNetworkMetrics({
+        packetsLost,
+        jitterMs: typeof jitter === "number" ? jitter * 1000 : null,
+        rttMs: typeof rtt === "number" ? rtt * 1000 : null
+      });
     } catch (error) {
       log("Stats collection failed", { message: error.message });
     }
@@ -1437,14 +1469,390 @@ const codec2 = {
   originalTrack: null,
   samplesPerFrame: 0,
   bytesPerFrame: 0,
+  frameDurationMs: 20,
+  packetizer: null,
+  headerCompressor: null,
+  headerDecompressor: null,
+  jitterBuffer: null,
+  plcModel: null,
+  neuralVocoder: null,
+  playoutIntervalId: null,
+  transportStats: null,
+  relaySocket: null,
+  relayReady: false,
 
   isSupported() {
     return Boolean(
       window.APP_CONFIG?.enableCodec2 &&
+      ExtremeStack &&
       typeof window.AudioContext === "function" &&
       typeof window.AudioWorkletNode === "function" &&
       typeof window.WebAssembly === "object"
     );
+  },
+
+  useRelayTransport() {
+    return Boolean(window.APP_CONFIG?.enableMediaRelay);
+  },
+
+  getNeuralRelayMode() {
+    return String(window.APP_CONFIG?.neuralRelayMode || "off").trim().toLowerCase();
+  },
+
+  resetTransportStats() {
+    this.transportStats = {
+      sentPackets: 0,
+      sentHeaderBytes: 0,
+      sentRawHeaderBytes: 0,
+      receivedPackets: 0,
+      receivedHeaderBytes: 0,
+      receivedRawHeaderBytes: 0,
+      concealedFrames: 0
+    };
+  },
+
+  updateDiagnostics() {
+    if (transportModeText) {
+      if (this.active) {
+        transportModeText.textContent = this.useRelayTransport()
+          ? "Codec2 relay RTP"
+          : "Codec2 compact RTP";
+      } else if (this.isSupported()) {
+        transportModeText.textContent = "Opus fallback";
+      } else {
+        transportModeText.textContent = "Unavailable";
+      }
+    }
+
+    if (headerText) {
+      if (this.transportStats?.sentPackets) {
+        const averageHeader = this.transportStats.sentHeaderBytes / this.transportStats.sentPackets;
+        const averageRaw = this.transportStats.sentRawHeaderBytes / this.transportStats.sentPackets;
+        headerText.textContent = `${averageHeader.toFixed(1)} / ${averageRaw.toFixed(1)} B`;
+      } else {
+        headerText.textContent = "-";
+      }
+    }
+
+    if (bufferText) {
+      if (this.jitterBuffer) {
+        const stats = this.jitterBuffer.getStats();
+        bufferText.textContent = `${stats.queuedPackets} q / ${stats.targetDelayMs} ms`;
+      } else {
+        bufferText.textContent = "-";
+      }
+    }
+
+    if (plcText) {
+      plcText.textContent = this.transportStats
+        ? String(this.transportStats.concealedFrames)
+        : "-";
+    }
+
+    if (vocoderText) {
+      if (this.useRelayTransport()) {
+        const mode = this.getNeuralRelayMode();
+        const backend = String(window.APP_CONFIG?.neuralRelayBackend || "unknown");
+        vocoderText.textContent =
+          mode === "off"
+            ? `Relay passthrough (${backend})`
+            : `${mode} relay (${backend})`;
+      } else {
+        vocoderText.textContent = this.neuralVocoder
+          ? this.neuralVocoder.describe()
+          : "Codec2 decode";
+      }
+    }
+  },
+
+  resetPlayoutState() {
+    if (!ExtremeStack || !this.samplesPerFrame) {
+      return;
+    }
+
+    this.plcModel = new ExtremeStack.FeatureTrajectoryPlcModel({
+      frameSamples: this.samplesPerFrame,
+      sampleRate: 8000
+    });
+    this.jitterBuffer = new ExtremeStack.AdaptiveJitterBuffer({
+      frameDurationMs: this.frameDurationMs,
+      sampleRate: 8000,
+      plcModel: this.plcModel
+    });
+  },
+
+  ensureTransportPipeline() {
+    if (!ExtremeStack || !this.samplesPerFrame || this.packetizer) {
+      return;
+    }
+
+    this.frameDurationMs = Math.max(20, Math.round((this.samplesPerFrame / 8000) * 1000));
+    this.packetizer = new ExtremeStack.RtpPacketizer({
+      payloadType: 97,
+      timestampStep: this.samplesPerFrame
+    });
+    this.headerCompressor = new ExtremeStack.RohcLiteCompressor();
+    this.headerDecompressor = new ExtremeStack.RohcLiteDecompressor();
+    this.neuralVocoder = new ExtremeStack.NeuralVocoderAdapter({
+      mode: "passthrough",
+      label: "Codec2 decoder"
+    });
+    this.resetPlayoutState();
+
+    if (this.playoutIntervalId) {
+      clearInterval(this.playoutIntervalId);
+    }
+    this.playoutIntervalId = window.setInterval(() => {
+      this.drainJitterBuffer();
+    }, Math.max(8, Math.floor(this.frameDurationMs / 2)));
+  },
+
+  postDecodePacket(packet, gain = 1, concealment = false) {
+    if (!this.decoderNode || !packet?.payload?.length) {
+      return;
+    }
+
+    if (packet.payloadType === 98) {
+      const byteLength = packet.payload.length - (packet.payload.length % 2);
+      const pcm = new Float32Array(byteLength / 2);
+      for (let index = 0; index < pcm.length; index += 1) {
+        const lo = packet.payload[index * 2];
+        const hi = packet.payload[index * 2 + 1];
+        let sample = (hi << 8) | lo;
+        if (sample & 0x8000) {
+          sample -= 0x10000;
+        }
+        pcm[index] = sample / 32768;
+      }
+      this.postInjectedPcm({ pcm, gain });
+      return;
+    }
+
+    const payload = packet.payload.slice();
+    this.decoderNode.port.postMessage({
+      type: "decode",
+      data: payload.buffer,
+      gain,
+      concealment,
+      features: packet.features || {}
+    }, [payload.buffer]);
+  },
+
+  postInjectedPcm(frame) {
+    if (!this.decoderNode || !frame?.pcm) {
+      return;
+    }
+
+    const pcm = frame.pcm instanceof Float32Array
+      ? frame.pcm.slice()
+      : new Float32Array(frame.pcm);
+
+    this.decoderNode.port.postMessage({
+      type: "inject-pcm",
+      data: pcm.buffer,
+      gain: frame.gain ?? 1,
+      concealment: true
+    }, [pcm.buffer]);
+  },
+
+  drainJitterBuffer() {
+    if (!this.jitterBuffer || !this.decoderNode) {
+      return;
+    }
+    if (!this.transportStats) {
+      this.resetTransportStats();
+    }
+
+    const frames = this.jitterBuffer.drain(performance.now());
+    for (const frame of frames) {
+      if (frame.concealed) {
+        this.transportStats.concealedFrames += 1;
+      }
+
+      if (frame.kind === "packet") {
+        this.postDecodePacket(frame.packet, frame.gain, frame.concealed);
+      } else if (frame.kind === "pcm") {
+        this.postInjectedPcm(frame);
+      }
+    }
+
+    if (frames.length > 0) {
+      this.updateDiagnostics();
+    }
+  },
+
+  sendEncodedFrame(payload, features = {}) {
+    if (!this.transportStats) {
+      this.resetTransportStats();
+    }
+
+    const sendBinary = (bytes) => {
+      if (this.useRelayTransport()) {
+        if (!this.relaySocket || this.relaySocket.readyState !== WebSocket.OPEN) {
+          return false;
+        }
+        this.relaySocket.send(bytes);
+        return true;
+      }
+
+      if (!this.dataChannel || this.dataChannel.readyState !== "open") {
+        return false;
+      }
+      this.dataChannel.send(bytes);
+      return true;
+    };
+
+    if (!this.packetizer || !this.headerCompressor) {
+      sendBinary(payload);
+      return;
+    }
+
+    const packet = this.packetizer.createPacket(payload, features);
+    const compressed = this.headerCompressor.compress(packet);
+
+    if (!sendBinary(compressed.bytes)) {
+      return;
+    }
+
+    this.transportStats.sentPackets += 1;
+    this.transportStats.sentHeaderBytes += compressed.headerBytes;
+    this.transportStats.sentRawHeaderBytes += compressed.rawHeaderBytes;
+    this.updateDiagnostics();
+  },
+
+  handleIncomingFrame(data) {
+    if (!this.decoderNode) {
+      return;
+    }
+    if (!this.transportStats) {
+      this.resetTransportStats();
+    }
+
+    if (this.headerDecompressor && this.jitterBuffer) {
+      try {
+        const decoded = this.headerDecompressor.decompress(new Uint8Array(data));
+        this.transportStats.receivedPackets += 1;
+        this.transportStats.receivedHeaderBytes += decoded.headerBytes;
+        this.transportStats.receivedRawHeaderBytes += decoded.rawHeaderBytes;
+        this.jitterBuffer.push(decoded.packet, performance.now());
+        this.updateDiagnostics();
+        return;
+      } catch (error) {
+        log("Codec2 compressed packet parse failed", { message: error.message });
+      }
+    }
+
+    this.decoderNode.port.postMessage(
+      { type: "decode", data },
+      [data]
+    );
+  },
+
+  updateNetworkMetrics(metrics) {
+    if (!this.jitterBuffer) {
+      return;
+    }
+
+    this.jitterBuffer.updateNetworkMetrics(metrics);
+    this.updateDiagnostics();
+  },
+
+  closeRelaySocket() {
+    if (!this.relaySocket) {
+      this.relayReady = false;
+      return;
+    }
+
+    this.relaySocket.onopen = null;
+    this.relaySocket.onclose = null;
+    this.relaySocket.onerror = null;
+    this.relaySocket.onmessage = null;
+
+    try {
+      this.relaySocket.close();
+    } catch (error) {
+      log("Codec2 relay socket close skipped", { message: error.message });
+    }
+
+    this.relaySocket = null;
+    this.relayReady = false;
+  },
+
+  async connectRelaySocket() {
+    if (!this.useRelayTransport()) {
+      return;
+    }
+
+    this.closeRelaySocket();
+
+    return new Promise((resolve, reject) => {
+      const socket = new WebSocket(buildMediaWebSocketUrl());
+      socket.binaryType = "arraybuffer";
+      let settled = false;
+
+      socket.onopen = () => {
+        this.relaySocket = socket;
+        socket.send(JSON.stringify({
+          type: "auth",
+          roomId: state.roomId,
+          participantId: state.participantId
+        }));
+      };
+
+      socket.onmessage = (event) => {
+        if (typeof event.data === "string") {
+          try {
+            const message = JSON.parse(event.data);
+            if (message.type === "media-ready") {
+              this.relayReady = true;
+              this.updateDiagnostics();
+              this.syncActiveState().catch((error) => {
+                log("Codec2 relay sync failed", { message: error.message });
+              });
+              if (!settled) {
+                settled = true;
+                resolve();
+              }
+              return;
+            }
+
+            if (message.type === "server-shutdown") {
+              log("Codec2 relay server is restarting");
+            } else if (message.type === "error") {
+              log("Codec2 relay error", { message: message.error });
+            }
+          } catch (error) {
+            log("Codec2 relay control parse failed", { message: error.message });
+          }
+          return;
+        }
+
+        if (event.data instanceof ArrayBuffer) {
+          this.handleIncomingFrame(event.data);
+        }
+      };
+
+      socket.onerror = () => {
+        if (!settled) {
+          settled = true;
+          reject(new Error("Relay WebSocket connection failed"));
+        }
+      };
+
+      socket.onclose = () => {
+        this.relayReady = false;
+        if (this.relaySocket === socket) {
+          this.relaySocket = null;
+        }
+        this.syncActiveState().catch((error) => {
+          log("Codec2 relay close sync failed", { message: error.message });
+        });
+        if (!settled) {
+          settled = true;
+          reject(new Error("Relay WebSocket closed before it connected"));
+        }
+      };
+    });
   },
 
   handleWorkerMessage(kind, data) {
@@ -1460,6 +1868,7 @@ const codec2 = {
     if (data.type === "ready") {
       this.samplesPerFrame = data.samplesPerFrame || this.samplesPerFrame;
       this.bytesPerFrame = data.bytesPerFrame || this.bytesPerFrame;
+      this.ensureTransportPipeline();
 
       if (kind === "encoder") {
         this.encoderReady = true;
@@ -1484,7 +1893,7 @@ const codec2 = {
 
     if (kind === "encoder" && data.type === "encoded") {
       if (this.active && this.dataChannel?.readyState === "open") {
-        this.dataChannel.send(data.data);
+        this.sendEncodedFrame(data.data, data.features || {});
       }
     }
   },
@@ -1538,10 +1947,7 @@ const codec2 = {
         return;
       }
 
-      this.decoderNode.port.postMessage(
-        { type: "decode", data: event.data },
-        [event.data]
-      );
+      this.handleIncomingFrame(event.data);
     };
   },
 
@@ -1564,12 +1970,22 @@ const codec2 = {
   },
 
   async syncActiveState() {
+    const transportReady = this.useRelayTransport()
+      ? Boolean(
+          this.relayReady &&
+          this.relaySocket &&
+          this.relaySocket.readyState === WebSocket.OPEN
+        )
+      : Boolean(
+          this.peerReady &&
+          this.dataChannel &&
+          this.dataChannel.readyState === "open"
+        );
+
     const shouldBeActive = Boolean(
       this.desiredActive &&
       this.localReady &&
-      this.peerReady &&
-      this.dataChannel &&
-      this.dataChannel.readyState === "open" &&
+      transportReady &&
       this.sender &&
       this.originalTrack
     );
@@ -1581,11 +1997,13 @@ const codec2 = {
     if (shouldBeActive) {
       await this.sender.replaceTrack(null);
       remoteAudio.muted = true;
+      this.resetPlayoutState();
       this.active = true;
       log("Codec2 transport active", {
         samplesPerFrame: this.samplesPerFrame,
         bytesPerFrame: this.bytesPerFrame
       });
+      this.updateDiagnostics();
       return;
     }
 
@@ -1594,7 +2012,9 @@ const codec2 = {
     }
     remoteAudio.muted = false;
     this.active = false;
+    this.resetPlayoutState();
     log("Codec2 transport inactive");
+    this.updateDiagnostics();
   },
 
   async setDesiredActive(enabled) {
@@ -1620,6 +2040,7 @@ const codec2 = {
       const wasmModule = await WebAssembly.compile(await wasmResponse.arrayBuffer());
 
       const audioCtx = new AudioContext({ sampleRate: 48000 });
+      await audioCtx.resume().catch(() => {});
       await audioCtx.audioWorklet.addModule("/codec2-worker.js");
 
       // Encoder: local mic → Codec2 → DataChannel
@@ -1641,24 +2062,30 @@ const codec2 = {
       this.originalTrack = localStream.getAudioTracks()[0] || null;
       this.desiredActive = state.audioProfile === "extreme";
 
-      peerConnection.ondatachannel = (event) => {
-        if (event.channel.label === "codec2") {
-          this.attachDataChannel(event.channel);
-        }
-      };
+      if (this.useRelayTransport()) {
+        await this.connectRelaySocket();
+      } else {
+        peerConnection.ondatachannel = (event) => {
+          if (event.channel.label === "codec2") {
+            this.attachDataChannel(event.channel);
+          }
+        };
 
-      if (initiator) {
-        const channel = peerConnection.createDataChannel("codec2", {
-          ordered: false,
-          maxRetransmits: 0
-        });
-        this.attachDataChannel(channel);
+        if (initiator) {
+          const channel = peerConnection.createDataChannel("codec2", {
+            ordered: false,
+            maxRetransmits: 0
+          });
+          this.attachDataChannel(channel);
+        }
       }
 
       this.encoderNode = encoderNode;
       this.decoderNode = decoderNode;
       this.audioContext = audioCtx;
+      this.resetTransportStats();
       log("Codec2 transport initialized");
+      this.updateDiagnostics();
     } catch (error) {
       log("Codec2 init failed, using Opus", { message: error.message });
       this.teardown();
@@ -1678,18 +2105,37 @@ const codec2 = {
     this.readyAnnouncementSent = false;
     this.samplesPerFrame = 0;
     this.bytesPerFrame = 0;
+    this.frameDurationMs = 20;
+    this.relayReady = false;
     remoteAudio.muted = false;
+    if (this.playoutIntervalId) {
+      clearInterval(this.playoutIntervalId);
+      this.playoutIntervalId = null;
+    }
     if (this.audioContext) {
       this.audioContext.close().catch(() => {});
     }
     if (this.dataChannel) {
+      this.dataChannel.onopen = null;
+      this.dataChannel.onclose = null;
+      this.dataChannel.onerror = null;
+      this.dataChannel.onmessage = null;
       this.dataChannel.close();
     }
+    this.closeRelaySocket();
     this.encoderNode = null;
     this.decoderNode = null;
     this.dataChannel = null;
     this.audioContext = null;
     this.sender = null;
     this.originalTrack = null;
+    this.packetizer = null;
+    this.headerCompressor = null;
+    this.headerDecompressor = null;
+    this.jitterBuffer = null;
+    this.plcModel = null;
+    this.neuralVocoder = null;
+    this.resetTransportStats();
+    this.updateDiagnostics();
   }
 };

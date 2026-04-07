@@ -2,3 +2,5 @@ node_modules/
 certs/
 .DS_Store
 *.log
+native/fargan-relay/bin/fargan-relay-worker-native
+native/fargan-relay/build/

@@ -258,6 +258,10 @@ input:focus { border-color: var(--accent); }
   gap: 8px;
 }
 
+.metric-wide {
+  grid-column: 1 / -1;
+}
+
 .metric {
   padding: 10px;
   border-radius: 8px;
