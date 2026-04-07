@@ -472,11 +472,7 @@ async function request(path, options = {}) {
 
 async function ensureLocalAudio() {
   if (state.localStream) {
-    if (codec2.useRelayTransport()) {
-      localAudio.srcObject = null;
-    } else {
-      localAudio.srcObject = state.localStream;
-    }
+    localAudio.srcObject = state.localStream;
     setMicStatus(
       "ready",
       "Microphone access is active on this device.",
@@ -506,10 +502,16 @@ async function ensureLocalAudio() {
     });
 
     state.localStream = stream;
+    localAudio.srcObject = stream;
     if (codec2.useRelayTransport()) {
-      localAudio.srcObject = null;
-    } else {
-      localAudio.srcObject = stream;
+      try {
+        await localAudio.play();
+        log("Local keepalive audio element playing", {
+          track: describeAudioTrack(stream.getAudioTracks()[0] || null)
+        });
+      } catch (error) {
+        log("Local keepalive audio element play deferred", { message: error.message });
+      }
     }
     setMicStatus(
       "ready",
@@ -987,7 +989,10 @@ async function createPeerConnection() {
 
   const stream = await ensureLocalAudio();
   for (const track of stream.getAudioTracks()) {
-    connection.addTrack(track, stream);
+    const senderTrack = codec2.useRelayTransport() ? track.clone() : track;
+    senderTrack.enabled = !state.muted;
+    const senderStream = senderTrack === track ? stream : new MediaStream([senderTrack]);
+    connection.addTrack(senderTrack, senderStream);
   }
 
   state.peerConnection = connection;
@@ -1508,6 +1513,9 @@ function toggleMute() {
   for (const track of state.localStream.getAudioTracks()) {
     track.enabled = !state.muted;
   }
+  if (codec2.senderTrack && codec2.senderTrack !== codec2.originalTrack) {
+    codec2.senderTrack.enabled = !state.muted;
+  }
   if (codec2.codec2Track) {
     codec2.codec2Track.enabled = !state.muted;
   }
@@ -1619,6 +1627,7 @@ const codec2 = {
   audioContext: null,
   sender: null,
   originalTrack: null,
+  senderTrack: null,
   codec2Track: null,
   codec2Stream: null,
   sourceNode: null,
@@ -2251,8 +2260,10 @@ const codec2 = {
       await audioCtx.audioWorklet.addModule("/codec2-worker.js");
 
       const originalTrack = localStream.getAudioTracks()[0] || null;
-      const codec2Track =
-        this.useRelayTransport() && originalTrack ? originalTrack.clone() : originalTrack;
+      const senderTrack = peerConnection
+        .getSenders()
+        .find((item) => item.track && item.track.kind === "audio")?.track || null;
+      const codec2Track = originalTrack;
       const codec2Stream = codec2Track ? new MediaStream([codec2Track]) : localStream;
       if (codec2Track) {
         codec2Track.enabled = !state.muted;
@@ -2261,6 +2272,7 @@ const codec2 = {
         relayTransport: this.useRelayTransport(),
         audioContextSampleRate: audioCtx.sampleRate,
         originalTrack: describeAudioTrack(originalTrack),
+        senderTrack: describeAudioTrack(senderTrack),
         codec2Track: describeAudioTrack(codec2Track)
       });
 
@@ -2355,6 +2367,7 @@ const codec2 = {
         .getSenders()
         .find((item) => item.track && item.track.kind === "audio") || null;
       this.originalTrack = originalTrack;
+      this.senderTrack = senderTrack;
       this.codec2Track = codec2Track;
       this.codec2Stream = codec2Stream;
       this.sourceNode = source;
@@ -2395,7 +2408,7 @@ const codec2 = {
   teardown({ closeAudioContext = true } = {}) {
     this.desiredActive = false;
     if (this.sender && this.originalTrack && this.active) {
-      this.sender.replaceTrack(this.originalTrack).catch(() => {});
+      this.sender.replaceTrack(this.senderTrack || this.originalTrack).catch(() => {});
     }
     this.active = false;
     this.localReady = false;
@@ -2441,9 +2454,9 @@ const codec2 = {
       }
       this.sourceNode = null;
     }
-    if (this.codec2Track && this.codec2Track !== this.originalTrack) {
+    if (this.senderTrack && this.senderTrack !== this.originalTrack) {
       try {
-        this.codec2Track.stop();
+        this.senderTrack.stop();
       } catch (error) {
         // best-effort cleanup
       }
@@ -2456,6 +2469,7 @@ const codec2 = {
     }
     this.sender = null;
     this.originalTrack = null;
+    this.senderTrack = null;
     this.codec2Track = null;
     this.codec2Stream = null;
     this.packetizer = null;
