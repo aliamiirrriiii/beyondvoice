@@ -124,6 +124,7 @@ const joinForm = document.querySelector("#join-form");
 const joinButton = document.querySelector("#join-button");
 const leaveButton = document.querySelector("#leave-button");
 const muteButton = document.querySelector("#mute-button");
+const speakerButton = document.querySelector("#speaker-button");
 const reconnectButton = document.querySelector("#reconnect-button");
 const clearLogButton = document.querySelector("#clear-log-button");
 const micBadge = document.querySelector("#mic-badge");
@@ -160,6 +161,9 @@ const state = {
   muted: false,
   localStream: null,
   remoteStream: null,
+  localMuteRecoveryTimerId: null,
+  localDeviceChangeTimerId: null,
+  suppressLocalAudioRecovery: false,
   signalingSocket: null,
   signalingConnected: false,
   pollAbortController: null,
@@ -171,6 +175,7 @@ const state = {
   autoRejoinInFlight: false,
   micPermissionState: "unknown",
   micPermissionStatus: null,
+  speakerEnabled: false,
   opusMode: "balanced",
   audioProfile: "lean"
 };
@@ -180,8 +185,11 @@ const DEFAULT_ICE_SERVERS = window.APP_CONFIG?.iceServers || [
 ];
 
 const PROFILE_SWITCH_COOLDOWN_MS = 5000;
+const LOCAL_MUTE_RECOVERY_DELAY_MS = 1800;
+const LOCAL_DEVICE_CHANGE_DEBOUNCE_MS = 500;
 let lastProfileSwitchAt = 0;
 
+const SPEAKER_STORAGE_KEY = "voiceai.speakerEnabled";
 const OPUS_MODE_STORAGE_KEY = "voiceai.opusMode";
 const OPUS_MODES = {
   saver: {
@@ -306,6 +314,22 @@ function readStoredOpusMode() {
 function writeStoredOpusMode(mode) {
   try {
     window.localStorage?.setItem(OPUS_MODE_STORAGE_KEY, normalizeOpusMode(mode));
+  } catch {
+    // ignore — best-effort
+  }
+}
+
+function readStoredSpeakerEnabled() {
+  try {
+    return window.localStorage?.getItem(SPEAKER_STORAGE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function writeStoredSpeakerEnabled(enabled) {
+  try {
+    window.localStorage?.setItem(SPEAKER_STORAGE_KEY, enabled ? "true" : "false");
   } catch {
     // ignore — best-effort
   }
@@ -450,9 +474,138 @@ function ensureRemotePlaybackStream() {
     state.remoteStream = new MediaStream();
   }
   if (remoteAudio && remoteAudio.srcObject !== state.remoteStream) {
+    remoteAudio.autoplay = true;
+    remoteAudio.playsInline = true;
+    remoteAudio.muted = false;
+    remoteAudio.volume = 1;
     remoteAudio.srcObject = state.remoteStream;
   }
   return state.remoteStream;
+}
+
+function getAudioSessionController() {
+  const candidate = navigator.audioSession || navigator.webkitAudioSession;
+  return candidate && typeof candidate === "object" ? candidate : null;
+}
+
+function getPreferredAudioSessionType() {
+  if (state.localStream) {
+    return "play-and-record";
+  }
+  if (state.speakerEnabled) {
+    return "playback";
+  }
+  return "auto";
+}
+
+function getPreferredSpeakerOutputScore(device) {
+  const label = String(device?.label || "").toLowerCase();
+  if (!label) {
+    return 0;
+  }
+
+  let score = 0;
+  if (/(^|\b)(speaker|speakers|loudspeaker)(\b|$)/.test(label)) score += 8;
+  if (/hands[\s-]?free/.test(label)) score += 6;
+  if (/built[\s-]?in/.test(label)) score += 3;
+  if (/(^|\b)(default|multimedia)(\b|$)/.test(label)) score += 2;
+  if (/(^|\b)(headset|headphones|earpiece|receiver)(\b|$)/.test(label)) score -= 6;
+  return score;
+}
+
+async function getPreferredAudioOutputDeviceId() {
+  if (!state.speakerEnabled) {
+    return "";
+  }
+  if (!navigator.mediaDevices?.enumerateDevices) {
+    return null;
+  }
+
+  try {
+    const outputs = (await navigator.mediaDevices.enumerateDevices())
+      .filter((device) => device.kind === "audiooutput");
+    if (outputs.length === 0) {
+      return null;
+    }
+
+    const preferred = outputs
+      .map((device) => ({ deviceId: device.deviceId || "", score: getPreferredSpeakerOutputScore(device) }))
+      .filter((device) => device.score > 0)
+      .sort((left, right) => right.score - left.score)[0];
+
+    return preferred?.deviceId || null;
+  } catch {
+    return null;
+  }
+}
+
+function applyAudioSessionPreference() {
+  const audioSession = getAudioSessionController();
+  if (!audioSession || !("type" in audioSession)) {
+    return false;
+  }
+
+  const nextType = getPreferredAudioSessionType();
+  if (audioSession.type === nextType) {
+    return true;
+  }
+
+  try {
+    audioSession.type = nextType;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function applyAudioSinkPreference() {
+  if (!remoteAudio || typeof remoteAudio.setSinkId !== "function") {
+    return false;
+  }
+
+  const nextSinkId = await getPreferredAudioOutputDeviceId();
+  if (nextSinkId == null) {
+    return false;
+  }
+  if (remoteAudio.sinkId === nextSinkId) {
+    return true;
+  }
+
+  try {
+    await remoteAudio.setSinkId(nextSinkId);
+    return true;
+  } catch {
+    try {
+      await remoteAudio.setSinkId("");
+    } catch {
+      // ignore — best-effort
+    }
+    return false;
+  }
+}
+
+async function syncSpeakerOutput({ replay = false } = {}) {
+  ensureRemotePlaybackStream();
+  const audioSessionApplied = applyAudioSessionPreference();
+  const audioSinkApplied = await applyAudioSinkPreference();
+
+  if (!replay || !remoteAudio) {
+    return audioSessionApplied || audioSinkApplied;
+  }
+
+  try {
+    const result = remoteAudio.play();
+    if (result && typeof result.catch === "function") {
+      await result;
+    }
+  } catch (error) {
+    log("Remote audio playback deferred", {
+      speakerEnabled: state.speakerEnabled,
+      message: error.message
+    });
+  }
+
+  return audioSessionApplied || audioSinkApplied;
 }
 
 function attachTrackToPeer(context, track) {
@@ -524,6 +677,151 @@ function clearPeerTimers(context) {
     clearTimeout(context.reconnectTimerId);
     context.reconnectTimerId = null;
   }
+}
+
+function clearLocalMuteRecoveryTimer() {
+  if (state.localMuteRecoveryTimerId) {
+    clearTimeout(state.localMuteRecoveryTimerId);
+    state.localMuteRecoveryTimerId = null;
+  }
+}
+
+function clearLocalDeviceChangeTimer() {
+  if (state.localDeviceChangeTimerId) {
+    clearTimeout(state.localDeviceChangeTimerId);
+    state.localDeviceChangeTimerId = null;
+  }
+}
+
+function getPrimaryLocalAudioTrack(stream = state.localStream) {
+  if (!stream || typeof stream.getAudioTracks !== "function") {
+    return null;
+  }
+  return stream.getAudioTracks()[0] || null;
+}
+
+function hasUsableLocalAudio(stream = state.localStream) {
+  const track = getPrimaryLocalAudioTrack(stream);
+  return Boolean(track && track.readyState === "live");
+}
+
+function detachLocalAudioLifecycle(stream = state.localStream) {
+  const track = getPrimaryLocalAudioTrack(stream);
+  if (!track) {
+    return;
+  }
+  track.onended = null;
+  track.onmute = null;
+  track.onunmute = null;
+}
+
+function invalidateLocalAudio(reason) {
+  const hadLocalAudio = Boolean(state.localStream);
+  if (hadLocalAudio) {
+    detachLocalAudioLifecycle(state.localStream);
+  }
+  clearLocalMuteRecoveryTimer();
+  state.localStream = null;
+  localAudio.srcObject = null;
+  syncSpeakerOutput().catch(() => {});
+  if (hadLocalAudio) {
+    log("Local microphone invalidated", { reason });
+  }
+  updateControls();
+  refreshMicPermissionState().catch((error) => {
+    log("Microphone permission refresh failed", { message: error.message });
+  });
+  return hadLocalAudio;
+}
+
+function recoverLocalAudio(reason) {
+  if (state.suppressLocalAudioRecovery) {
+    return;
+  }
+
+  invalidateLocalAudio(reason);
+  if (!state.joined) {
+    return;
+  }
+
+  attemptAutoRejoin(reason).catch((error) => {
+    log("Automatic rejoin after local audio loss failed", {
+      reason,
+      message: error.message
+    });
+  });
+}
+
+function bindLocalAudioLifecycle(stream) {
+  const track = getPrimaryLocalAudioTrack(stream);
+  if (!track) {
+    return;
+  }
+
+  clearLocalMuteRecoveryTimer();
+  track.onended = () => {
+    if (state.suppressLocalAudioRecovery || getPrimaryLocalAudioTrack() !== track) {
+      return;
+    }
+    log("Local microphone track ended", {
+      id: track.id,
+      readyState: track.readyState
+    });
+    recoverLocalAudio("local microphone ended");
+  };
+  track.onmute = () => {
+    if (state.suppressLocalAudioRecovery || getPrimaryLocalAudioTrack() !== track) {
+      return;
+    }
+    log("Local microphone track muted", {
+      id: track.id,
+      readyState: track.readyState
+    });
+    clearLocalMuteRecoveryTimer();
+    state.localMuteRecoveryTimerId = window.setTimeout(() => {
+      state.localMuteRecoveryTimerId = null;
+      if (
+        state.suppressLocalAudioRecovery ||
+        getPrimaryLocalAudioTrack() !== track
+      ) {
+        return;
+      }
+      if (track.readyState !== "live" || track.muted) {
+        recoverLocalAudio("local microphone stayed muted");
+      }
+    }, LOCAL_MUTE_RECOVERY_DELAY_MS);
+  };
+  track.onunmute = () => {
+    if (getPrimaryLocalAudioTrack() !== track) {
+      return;
+    }
+    clearLocalMuteRecoveryTimer();
+    log("Local microphone track unmuted", { id: track.id });
+  };
+}
+
+function handleLocalDeviceChange() {
+  clearLocalDeviceChangeTimer();
+  state.localDeviceChangeTimerId = window.setTimeout(() => {
+    state.localDeviceChangeTimerId = null;
+    syncSpeakerOutput().catch(() => {});
+
+    if (state.suppressLocalAudioRecovery || (!state.joined && !state.localStream)) {
+      return;
+    }
+
+    const track = getPrimaryLocalAudioTrack();
+    if (track && track.readyState === "live" && !track.muted) {
+      return;
+    }
+
+    log("Media devices changed", {
+      joined: state.joined,
+      trackReadyState: track?.readyState || null,
+      trackMuted: track?.muted ?? null
+    });
+    recoverLocalAudio("local audio device changed");
+  }, LOCAL_DEVICE_CHANGE_DEBOUNCE_MS);
 }
 
 function syncPeerSummary() {
@@ -758,6 +1056,16 @@ function updateControls() {
   if (reconnectButton) {
     reconnectButton.disabled = !state.joined || peerContexts.size === 0;
   }
+  if (speakerButton) {
+    speakerButton.disabled = false;
+    speakerButton.classList.toggle("is-active", Boolean(state.speakerEnabled));
+    speakerButton.setAttribute("aria-pressed", state.speakerEnabled ? "true" : "false");
+    speakerButton.setAttribute(
+      "aria-label",
+      state.speakerEnabled ? "Disable speaker output" : "Enable speaker output"
+    );
+    setCtrlButtonLabel(speakerButton, "Speaker");
+  }
   if (roleText) {
     roleText.textContent = state.role || "—";
   }
@@ -781,6 +1089,8 @@ function primeRemoteAudio() {
   if (!remoteAudio) {
     return;
   }
+  applyAudioSessionPreference();
+  applyAudioSinkPreference().catch(() => {});
   try {
     const result = remoteAudio.play();
     if (result && typeof result.catch === "function") {
@@ -999,8 +1309,13 @@ async function request(path, options = {}) {
 }
 
 async function ensureLocalAudio() {
+  if (state.localStream && !hasUsableLocalAudio()) {
+    invalidateLocalAudio("cached local microphone is no longer usable");
+  }
+
   if (state.localStream) {
     localAudio.srcObject = state.localStream;
+    syncSpeakerOutput().catch(() => {});
     setMicStatus(
       "ready",
       "Microphone access is active on this device.",
@@ -1026,7 +1341,9 @@ async function ensureLocalAudio() {
     });
 
     state.localStream = stream;
+    bindLocalAudioLifecycle(stream);
     localAudio.srcObject = stream;
+    syncSpeakerOutput().catch(() => {});
     setMicStatus(
       "ready",
       "Microphone access is active on this device.",
@@ -1050,12 +1367,18 @@ function stopLocalAudio() {
     return;
   }
 
+  state.suppressLocalAudioRecovery = true;
+  clearLocalMuteRecoveryTimer();
+  clearLocalDeviceChangeTimer();
+  detachLocalAudioLifecycle(state.localStream);
   for (const track of state.localStream.getTracks()) {
     track.stop();
   }
 
   state.localStream = null;
   localAudio.srcObject = null;
+  syncSpeakerOutput().catch(() => {});
+  state.suppressLocalAudioRecovery = false;
   refreshMicPermissionState().catch((error) => {
     log("Microphone permission refresh failed", { message: error.message });
   });
@@ -1186,6 +1509,9 @@ function resetCallState({ preserveLog = true } = {}) {
   state.iceServers = null;
   state.muted = false;
   state.audioProfile = getDefaultAudioProfileForMode(state.opusMode);
+  state.suppressLocalAudioRecovery = false;
+  clearLocalMuteRecoveryTimer();
+  clearLocalDeviceChangeTimer();
 
   if (state.pollAbortController) {
     state.pollAbortController.abort();
@@ -2275,6 +2601,20 @@ function toggleMute() {
   updateControls();
 }
 
+async function toggleSpeakerOutput() {
+  state.speakerEnabled = !state.speakerEnabled;
+  writeStoredSpeakerEnabled(state.speakerEnabled);
+  updateControls();
+
+  const routed = await syncSpeakerOutput({ replay: true });
+  if (!routed) {
+    log("Browser kept the default audio route", {
+      speakerEnabled: state.speakerEnabled
+    });
+  }
+  log(state.speakerEnabled ? "Speaker output enabled" : "Speaker output disabled");
+}
+
 if (joinForm) {
   joinForm.addEventListener("submit", joinRoom);
 }
@@ -2283,6 +2623,13 @@ if (leaveButton) {
 }
 if (muteButton) {
   muteButton.addEventListener("click", toggleMute);
+}
+if (speakerButton) {
+  speakerButton.addEventListener("click", () => {
+    toggleSpeakerOutput().catch((error) => {
+      log("Speaker output toggle failed", { message: error.message });
+    });
+  });
 }
 if (reconnectButton) {
   reconnectButton.addEventListener("click", () => {
@@ -2319,9 +2666,14 @@ window.addEventListener("beforeunload", () => {
     );
   }
 });
+if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === "function") {
+  navigator.mediaDevices.addEventListener("devicechange", handleLocalDeviceChange);
+}
 
 resetRemoteAudio();
 applyOpusMode(readStoredOpusMode(), { persist: false, resetProfile: true });
+state.speakerEnabled = readStoredSpeakerEnabled();
+syncSpeakerOutput().catch(() => {});
 (async () => {
   await refreshMicPermissionState().catch(() => "unknown");
 })();
