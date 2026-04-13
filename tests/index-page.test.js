@@ -79,6 +79,8 @@ async function run() {
     assert.match(html, /id="speaker-button"/);
     assert.match(html, /aria-label="Enable speaker output"/);
     assert.match(html, /id="remote-audio"/);
+    assert.match(html, /<audio id="local-audio" playsinline muted><\/audio>/);
+    assert.doesNotMatch(html, /<audio id="local-audio"[^>]*autoplay/);
   } catch (error) {
     error.message = `${error.message}\nserver stdout:\n${stdout.join("")}\nserver stderr:\n${stderr.join("")}`;
     throw error;

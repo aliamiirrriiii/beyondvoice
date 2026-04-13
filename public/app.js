@@ -175,6 +175,17 @@ const state = {
   autoRejoinInFlight: false,
   micPermissionState: "unknown",
   micPermissionStatus: null,
+  audioProcessing: {
+    echoCancellationSupported: false,
+    echoCancellationRequested: false,
+    echoCancellationActive: null,
+    noiseSuppressionSupported: false,
+    noiseSuppressionRequested: false,
+    noiseSuppressionActive: null,
+    autoGainControlSupported: false,
+    autoGainControlRequested: null,
+    autoGainControlActive: null
+  },
   speakerEnabled: false,
   opusMode: "balanced",
   audioProfile: "lean"
@@ -483,6 +494,21 @@ function ensureRemotePlaybackStream() {
   return state.remoteStream;
 }
 
+function resetLocalAudioMonitor() {
+  if (!localAudio) {
+    return;
+  }
+
+  localAudio.defaultMuted = true;
+  localAudio.muted = true;
+  localAudio.autoplay = false;
+  localAudio.playsInline = true;
+  localAudio.volume = 0;
+  if (localAudio.srcObject) {
+    localAudio.srcObject = null;
+  }
+}
+
 function getAudioSessionController() {
   const candidate = navigator.audioSession || navigator.webkitAudioSession;
   return candidate && typeof candidate === "object" ? candidate : null;
@@ -722,7 +748,8 @@ function invalidateLocalAudio(reason) {
   }
   clearLocalMuteRecoveryTimer();
   state.localStream = null;
-  localAudio.srcObject = null;
+  resetAudioProcessingState();
+  resetLocalAudioMonitor();
   syncSpeakerOutput().catch(() => {});
   if (hadLocalAudio) {
     log("Local microphone invalidated", { reason });
@@ -1140,8 +1167,191 @@ function buildDeviceSpecificGuidance() {
   return "Use a trusted HTTPS page, then allow Microphone when the browser prompt appears. If you denied it earlier, re-enable it in the browser site settings.";
 }
 
-function isSafariFamilyBrowser() {
-  return /^((?!chrome|android).)*safari/i.test(navigator.userAgent || "");
+function buildPreferredAudioConstraints() {
+  const supported = navigator.mediaDevices?.getSupportedConstraints?.() || null;
+  if (!supported) {
+    return {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: false
+    };
+  }
+
+  const constraints = {};
+  if (supported.echoCancellation) {
+    constraints.echoCancellation = true;
+  }
+  if (supported.noiseSuppression) {
+    constraints.noiseSuppression = true;
+  }
+  if (supported.autoGainControl) {
+    constraints.autoGainControl = false;
+  }
+
+  return Object.keys(constraints).length > 0 ? constraints : true;
+}
+
+function resetAudioProcessingState() {
+  state.audioProcessing = {
+    echoCancellationSupported: false,
+    echoCancellationRequested: false,
+    echoCancellationActive: null,
+    noiseSuppressionSupported: false,
+    noiseSuppressionRequested: false,
+    noiseSuppressionActive: null,
+    autoGainControlSupported: false,
+    autoGainControlRequested: null,
+    autoGainControlActive: null
+  };
+  return state.audioProcessing;
+}
+
+function updateAudioProcessingState(track, requestedAudioConstraints = null) {
+  const supported = navigator.mediaDevices?.getSupportedConstraints?.() || {};
+  const requested =
+    requestedAudioConstraints && typeof requestedAudioConstraints === "object"
+      ? requestedAudioConstraints
+      : {};
+  let settings = null;
+  try {
+    settings = typeof track?.getSettings === "function" ? track.getSettings() : null;
+  } catch {
+    settings = null;
+  }
+
+  state.audioProcessing = {
+    echoCancellationSupported: Boolean(supported.echoCancellation),
+    echoCancellationRequested:
+      requestedAudioConstraints === true || requested.echoCancellation === true,
+    echoCancellationActive:
+      settings && typeof settings.echoCancellation === "boolean"
+        ? settings.echoCancellation
+        : null,
+    noiseSuppressionSupported: Boolean(supported.noiseSuppression),
+    noiseSuppressionRequested:
+      requestedAudioConstraints === true || requested.noiseSuppression === true,
+    noiseSuppressionActive:
+      settings && typeof settings.noiseSuppression === "boolean"
+        ? settings.noiseSuppression
+        : null,
+    autoGainControlSupported: Boolean(supported.autoGainControl),
+    autoGainControlRequested:
+      requestedAudioConstraints === true
+        ? null
+        : typeof requested.autoGainControl === "boolean"
+          ? requested.autoGainControl
+          : null,
+    autoGainControlActive:
+      settings && typeof settings.autoGainControl === "boolean"
+        ? settings.autoGainControl
+        : null
+  };
+  return state.audioProcessing;
+}
+
+function getLocalEchoRiskReason() {
+  if (!state.localStream) {
+    return "";
+  }
+
+  if (
+    state.audioProcessing.echoCancellationSupported &&
+    state.audioProcessing.echoCancellationRequested &&
+    state.audioProcessing.echoCancellationActive === false
+  ) {
+    return "The browser reported echo cancellation as inactive for this microphone path.";
+  }
+
+  return "";
+}
+
+function canEnableSpeakerOutput() {
+  const reason = getLocalEchoRiskReason();
+  if (reason) {
+    return {
+      ok: false,
+      reason: `${reason} Use the earpiece or headphones instead of speaker output.`
+    };
+  }
+
+  return { ok: true, reason: "" };
+}
+
+async function enforceSafeSpeakerMode({ replay = false } = {}) {
+  const speakerGate = canEnableSpeakerOutput();
+  if (speakerGate.ok || !state.speakerEnabled) {
+    return false;
+  }
+
+  state.speakerEnabled = false;
+  writeStoredSpeakerEnabled(false);
+  updateControls();
+  await syncSpeakerOutput({ replay });
+  setMicStatus(
+    "warning",
+    "Microphone access is active, but echo protection is limited on this device.",
+    speakerGate.reason
+  );
+  log("Speaker output disabled because echo cancellation is inactive", {
+    echoCancellationSupported: state.audioProcessing.echoCancellationSupported,
+    echoCancellationRequested: state.audioProcessing.echoCancellationRequested,
+    echoCancellationActive: state.audioProcessing.echoCancellationActive
+  });
+  return true;
+}
+
+async function auditLocalAudioProcessing(stream = state.localStream, requestedAudioConstraints = null) {
+  const track = getPrimaryLocalAudioTrack(stream);
+  if (!track) {
+    return resetAudioProcessingState();
+  }
+
+  let snapshot = updateAudioProcessingState(track, requestedAudioConstraints);
+  if (
+    snapshot.echoCancellationSupported &&
+    snapshot.echoCancellationRequested &&
+    snapshot.echoCancellationActive !== true &&
+    typeof track.applyConstraints === "function"
+  ) {
+    const retryConstraints = {};
+    if (snapshot.echoCancellationSupported) {
+      retryConstraints.echoCancellation = true;
+    }
+    if (snapshot.noiseSuppressionSupported && snapshot.noiseSuppressionRequested) {
+      retryConstraints.noiseSuppression = true;
+    }
+    if (
+      snapshot.autoGainControlSupported &&
+      snapshot.autoGainControlRequested === false
+    ) {
+      retryConstraints.autoGainControl = false;
+    }
+
+    if (Object.keys(retryConstraints).length > 0) {
+      try {
+        await track.applyConstraints(retryConstraints);
+      } catch (error) {
+        log("Local audio processing retry failed", {
+          message: error.message,
+          retryConstraints
+        });
+      }
+      snapshot = updateAudioProcessingState(track, requestedAudioConstraints);
+    }
+  }
+
+  const speakerForcedOff = await enforceSafeSpeakerMode({ replay: true });
+  const echoRiskReason = getLocalEchoRiskReason();
+  if (!speakerForcedOff && echoRiskReason) {
+    setMicStatus(
+      "warning",
+      "Microphone access is active, but echo protection is limited on this device.",
+      `${echoRiskReason} Use the earpiece or headphones to avoid echo.`
+    );
+  }
+
+  log("Local audio processing state", snapshot);
+  return snapshot;
 }
 
 function describeAudioTrack(track) {
@@ -1314,35 +1524,31 @@ async function ensureLocalAudio() {
   }
 
   if (state.localStream) {
-    localAudio.srcObject = state.localStream;
+    resetLocalAudioMonitor();
     syncSpeakerOutput().catch(() => {});
     setMicStatus(
       "ready",
       "Microphone access is active on this device.",
       "You can stay in the room or reconnect without another permission prompt."
     );
+    await auditLocalAudioProcessing(state.localStream);
     return state.localStream;
   }
 
   await refreshMicPermissionState();
 
   try {
-    // Do NOT force sampleRate/channelCount/sampleSize constraints.
-    // Safari is more reliable when we avoid forcing capture formats and keep
-    // echo cancellation off. Other browsers still get noise suppression.
-    const safariFamily = isSafariFamilyBrowser();
+    // Keep capture constraints minimal, but request browser audio processing
+    // when the engine advertises support for it.
+    const requestedAudioConstraints = buildPreferredAudioConstraints();
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: !safariFamily,
-        noiseSuppression: true,
-        autoGainControl: false
-      },
+      audio: requestedAudioConstraints,
       video: false
     });
 
     state.localStream = stream;
     bindLocalAudioLifecycle(stream);
-    localAudio.srcObject = stream;
+    resetLocalAudioMonitor();
     syncSpeakerOutput().catch(() => {});
     setMicStatus(
       "ready",
@@ -1350,8 +1556,9 @@ async function ensureLocalAudio() {
       "The browser granted access and the app can now join calls."
     );
     updateControls();
+    await auditLocalAudioProcessing(stream, requestedAudioConstraints);
     log("Local microphone captured", {
-      safariFamily,
+      requestedAudioConstraints,
       track: describeAudioTrack(stream.getAudioTracks()[0] || null)
     });
     return stream;
@@ -1376,7 +1583,8 @@ function stopLocalAudio() {
   }
 
   state.localStream = null;
-  localAudio.srcObject = null;
+  resetAudioProcessingState();
+  resetLocalAudioMonitor();
   syncSpeakerOutput().catch(() => {});
   state.suppressLocalAudioRecovery = false;
   refreshMicPermissionState().catch((error) => {
@@ -2602,7 +2810,27 @@ function toggleMute() {
 }
 
 async function toggleSpeakerOutput() {
-  state.speakerEnabled = !state.speakerEnabled;
+  const nextSpeakerEnabled = !state.speakerEnabled;
+  if (nextSpeakerEnabled) {
+    const speakerGate = canEnableSpeakerOutput();
+    if (!speakerGate.ok) {
+      setMicStatus(
+        "warning",
+        "Speaker output stayed off to avoid echo.",
+        speakerGate.reason
+      );
+      log("Speaker output blocked", {
+        reason: speakerGate.reason,
+        echoCancellationSupported: state.audioProcessing.echoCancellationSupported,
+        echoCancellationRequested: state.audioProcessing.echoCancellationRequested,
+        echoCancellationActive: state.audioProcessing.echoCancellationActive
+      });
+      updateControls();
+      return;
+    }
+  }
+
+  state.speakerEnabled = nextSpeakerEnabled;
   writeStoredSpeakerEnabled(state.speakerEnabled);
   updateControls();
 
@@ -2671,6 +2899,7 @@ if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener ===
 }
 
 resetRemoteAudio();
+resetLocalAudioMonitor();
 applyOpusMode(readStoredOpusMode(), { persist: false, resetProfile: true });
 state.speakerEnabled = readStoredSpeakerEnabled();
 syncSpeakerOutput().catch(() => {});
